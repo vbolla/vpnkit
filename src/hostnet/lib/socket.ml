@@ -216,9 +216,13 @@ module Stream = struct
         )
 
   let close t =
+Log.info (fun f -> f "Socket.TCPV4.close already-closed:%b" t.closed);
     if not t.closed then begin
       t.closed <- true;
       Lwt_unix.close t.fd
+>>= fun () ->
+Log.info (fun f -> f "Socket.TCPV4.close and I'm done");
+Lwt.return ()
     end else Lwt.return ()
 
   (* FLOW boilerplate *)

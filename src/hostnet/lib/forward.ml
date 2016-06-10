@@ -129,7 +129,7 @@ let bind local =
     >>= fun () ->
     Binder.bind local_ip local_port false
 
-let start_tcp_proxy vsock_path_var _local_ip _local_port fd t =
+let start_tcp_proxy _vsock_path_var _local_ip _local_port fd t =
   (* On failure here, we must close the fd *)
   Lwt.catch
     (fun () ->
@@ -159,6 +159,9 @@ let start_tcp_proxy vsock_path_var _local_ip _local_port fd t =
       Lwt.catch (fun () ->
           Lwt_unix.accept fd
           >>= fun (local_fd, _) ->
+          Lwt_unix.setsockopt local_fd Lwt_unix.TCP_NODELAY true;
+          Lwt_unix.setsockopt_optint local_fd Lwt_unix.SO_LINGER None;
+          Log.info (fun f -> f "%s: set TCP_NODELAY and SO_LINGER" description);
           Lwt.return (Some local_fd)
         ) (function
           | Unix.Unix_error(Unix.EBADF, _, _) -> Lwt.return None
@@ -172,8 +175,6 @@ let start_tcp_proxy vsock_path_var _local_ip _local_port fd t =
         Lwt.return ()
       | Some local_fd ->
         let local = Socket.Stream.of_fd ~description local_fd in
-        Active_list.Var.read vsock_path_var
-        >>= fun _vsock_path ->
         let proxy () =
           finally (fun () ->
             Connector.connect t.remote_port
@@ -188,16 +189,22 @@ let start_tcp_proxy vsock_path_var _local_ip _local_port fd t =
                 Lwt.return ()
               | `Ok (l_stats, r_stats) ->
                 Log.debug (fun f ->
-                    f "%s completed: l2r = %s; r2l = %s" description
+                    f "%s XXX completed: l2r = %s; r2l = %s" description
                       (Mirage_flow.CopyStats.to_string l_stats) (Mirage_flow.CopyStats.to_string r_stats)
                   );
                 Lwt.return ()
             ) (fun () ->
+Log.debug (fun f -> f "%s calling Connector.close" description);
               Connector.close remote
+>>= fun () ->
+Log.debug (fun f -> f "%s finished Connector.close" description);
+Lwt.return ()
             )
           ) (fun () ->
+Log.debug (fun f -> f "%s: calling Socket.Stream.close" description);
             Socket.Stream.close local
             >>= fun () ->
+Log.debug (fun f -> f "%s: finished Socket.Stream.close" description);
             Lwt.return ()
           )
         in
