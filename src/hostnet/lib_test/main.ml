@@ -195,6 +195,7 @@ let test_tcp = [
 (* Run it *)
 let () =
   Logs.set_reporter (Logs_fmt.reporter ());
+  Forwarding.test_10_connections();
   Alcotest.run "Hostnet" [
     "DHCP", test_dhcp;
     "DNS UDP", test_dns;

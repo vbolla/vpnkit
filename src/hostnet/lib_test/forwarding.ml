@@ -244,6 +244,13 @@ let test_10_connections () =
                     loop 10
                     >>= fun () ->
                     let time = Unix.gettimeofday () -. start in
+Printf.fprintf stderr "Port is %d\n%!" port;
+let rec loop () =
+  LocalServer.accept server
+  >>= fun () ->
+  loop () in
+loop ()
+>>= fun () ->
                     (* NOTE(djs55): on my MBP this is almost immediate *)
                     if time > 1. then failwith (Printf.sprintf "10 connections took %.02f (> 1) seconds" time);
                     Lwt.return ()
