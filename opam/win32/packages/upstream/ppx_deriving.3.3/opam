@@ -10,7 +10,7 @@ tags: [ "syntax" ]
 substs: [ "pkg/META" ]
 build: [
   # If there is no native dynlink, we can't use native builds
-  "ocaml" "pkg/build.ml" "native=%{ocaml-native-dynlink}%"
+  "ocaml" "pkg/build.ml" "native=true"
                          "native-dynlink=%{ocaml-native-dynlink}%"
 ]
 build-test: [
