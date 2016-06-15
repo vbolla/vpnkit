@@ -269,13 +269,6 @@ let command =
 
 let () =
   Printexc.record_backtrace true;
-  let s = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  let rec loop acc = function
-    | 0 -> acc
-    | n -> loop (s :: acc) (n - 1) in
-  let fds = loop [] 128 in
-  let _, _, _ = Unix.select fds fds fds 0. in
-  if true then failwith "should be dead already";
   match Term.eval command with
   | `Error _ -> exit 1
   | _ -> exit 0
