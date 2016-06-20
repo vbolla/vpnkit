@@ -31,26 +31,39 @@ let listen path =
     let i = String.sub path 3 (String.length path - 3) in
     let x = try int_of_string i with _ -> failwith (Printf.sprintf "Failed to parse command-line argument [%s]" path) in
     let fd = Unix_representations.file_descr_of_int x in
-    Lwt.return (Lwt_unix.of_unix_file_descr fd)
+    Lwt.return (Uwt.Pipe.openpipe_exn fd)
   end else begin
-    Lwt.catch
-      (fun () -> Lwt_unix.unlink path)
-      (function
-        | Unix.Unix_error(Unix.ENOENT, _, _) -> Lwt.return ()
-        | e -> Lwt.fail e)
+    ( match Unix.unlink path with
+      | exception Unix.Unix_error(Unix.ENOENT, _, _) -> Lwt.return ()
+      | exception e -> Lwt.fail e
+      | () -> Lwt.return () )
     >>= fun () ->
-    let s = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0 in
-    Lwt_unix.bind s (Lwt_unix.ADDR_UNIX path);
-    Lwt_unix.listen s 5;
+    let s = Uwt.Pipe.init () in
+    Uwt.Pipe.bind_exn s ~path;
     Lwt.return s
   end
+
+let with_pipe_accept pipe f =
+  Uwt.Pipe.listen_exn pipe ~max:5 ~cb:(fun server x ->
+    if Uwt.Int_result.is_error x then
+      ignore(Uwt_io.printl "listen error")
+    else
+      let client = Uwt.Pipe.init () in
+      let t = Uwt.Pipe.accept_raw ~server ~client in
+      if Uwt.Int_result.is_error t then begin
+        ignore(Uwt_io.printl "accept error");
+      end else begin
+        let conn = Conn_uwt_pipe.connect client in
+        f conn
+      end
+  )
 
 let start_port_forwarding port_control_path vsock_path =
   Log.info (fun f -> f "starting port_forwarding port_control_path:%s vsock_path:%s" port_control_path vsock_path);
   (* Start the 9P port forwarding server *)
   Connect.vsock_path := vsock_path;
   let module Ports = Active_list.Make(Forward) in
-  let module Server = Server9p_unix.Make(Log)(Ports) in
+  let module Server = Protocol_9p.Server.Make(Log)(Conn_uwt_pipe)(Ports) in
   let fs = Ports.make () in
   Socket_stack.connect ()
   >>= function
@@ -61,12 +74,25 @@ let start_port_forwarding port_control_path vsock_path =
   Ports.set_context fs vsock_path;
   listen port_control_path
   >>= fun port_s ->
-  let server = Server.of_fd fs port_s in
-  Server.serve_forever server
-  >>= fun r ->
-  Lwt.return (or_failwith r)
+  with_pipe_accept port_s
+    (fun conn ->
+      Lwt.async
+        (fun () ->
+          log_exception_continue "Server.connect on 9P"
+            (fun () ->
+              Server.connect fs conn ()
+              >>= function
+              | Result.Error (`Msg m) ->
+                Log.err (fun f -> f "failed to establish 9P connection: %s" m);
+                Lwt.return ()
+              | Result.Ok _ ->
+                Lwt.return ()
+            )
+        )
+    );
+  Lwt.return ()
 
-module Slirp_stack = Slirp.Make(Vmnet.Make(Hostnet.Conn_lwt_unix))(Resolv_conf)
+module Slirp_stack = Slirp.Make(Vmnet.Make(Conn_uwt_pipe))(Resolv_conf)
 
 let set_nofile nofile =
   let open Sys_resource.Resource in
@@ -89,30 +115,16 @@ let main_t socket_path port_control_path vsock_path db_path nofile =
   );
   listen socket_path
   >>= fun s ->
-
-  Lwt.async (fun () ->
-    log_exception_continue "start_port_server"
-      (fun () ->
-        start_port_forwarding port_control_path vsock_path
-      )
-    );
-
+  start_port_forwarding port_control_path vsock_path
+  >>= fun () ->
   let config = Active_config.create "unix" db_path in
   Slirp_stack.create config
   >>= fun stack ->
-  let rec loop () =
-    Lwt_unix.accept s
-    >>= fun (client, _) ->
-    Lwt.async (fun () ->
-      log_exception_continue "slirp_server"
-        (fun () ->
-          let conn = Hostnet.Conn_lwt_unix.connect client in
-          Slirp_stack.connect stack conn
-        )
-      (* NB: the vmnet layer will call close when it receives EOF *)
+  with_pipe_accept s
+    (fun conn ->
+      ignore(Slirp_stack.connect stack conn)
     );
-    loop () in
-  loop ()
+  Lwt.return ()
 
 let main socket port_control vsock_path db nofile debug =
   Osx_reporter.install ~stdout:debug;
