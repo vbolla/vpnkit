@@ -9,6 +9,7 @@ depends: [
   "result"
   "ipaddr"
   "lwt"
+  "uwt"
   "ofs"
   "osx-daemon"
   "osx-hyperkit"
