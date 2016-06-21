@@ -1,4 +1,5 @@
 open Lwt.Infix
+open Uwt_compat
 
 let src =
   let src = Logs.Src.create "dns" ~doc:"Resolve DNS queries on the host" in
@@ -108,42 +109,44 @@ let input ~ip ~udp ~src ~dst ~src_port buf =
   end;
   >>= function
   | Some (dst, dst_port) -> begin
-    let remote_sockaddr = Lwt_unix.ADDR_INET(Unix.inet_addr_of_string @@ Ipaddr.to_string dst, dst_port) in
-
-    let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 in
+    let fd = Uwt.Udp.init () in
+    (* FIXME(djs55): why of_unix_sockaddr_exn? *)
+    let remote_sockaddr =
+      let unix = Unix.ADDR_INET(Unix.inet_addr_of_string @@ Ipaddr.to_string dst, dst_port) in
+      Uwt_base.Conv.of_unix_sockaddr_exn unix in
     Log.debug (fun f -> f "DNS[%s] Forwarding to %s" (tidstr_of_dns dns) (Ipaddr.to_string dst));
-    Lwt_unix.connect fd remote_sockaddr >>= fun () ->
     Lwt.catch
       (fun () ->
-        let payload = Cstruct.to_string buf in
-        Lwt_unix.send fd payload 0 (String.length payload) []
-        >>= fun n ->
-        if n <> buf.Cstruct.len
-        then Log.err (fun f -> f "DNS[%s] forwarder: Lwt_bytes.send short: expected %d got %d" (tidstr_of_dns dns) buf.Cstruct.len n);
-        Lwt.return ()
+        Uwt.Udp.send_ba ~pos:buf.Cstruct.off ~len:buf.Cstruct.len ~buf:buf.Cstruct.buffer fd remote_sockaddr
       ) (fun e ->
         Log.err (fun f -> f "DNS[%s] send failed with %s" (tidstr_of_dns dns) (Printexc.to_string e));
         Lwt.return ()
       )
     >>= fun () ->
     let receiver =
-      let bytes = Bytes.make 4096 '\000' in
+      let buf = Cstruct.create 4096 in
       Lwt.catch
         (fun () ->
-          Lwt_unix.recv fd bytes 0 (String.length bytes) []
-           >>= fun n ->
-           let buffer = Cstruct.create n in
-           Cstruct.blit_from_string bytes 0 buffer 0 n;
-           Lwt.return (`Result buffer)
+          Uwt.Udp.recv_ba ~pos:buf.Cstruct.off ~len:buf.Cstruct.len ~buf:buf.Cstruct.buffer fd
+          >>= fun recv ->
+          if recv.Uwt.Udp.is_partial then begin
+            Log.err (fun f -> f "DNS[%s] dropping partial response" (tidstr_of_dns dns));
+            Lwt.return `Error
+          end else if recv.Uwt.Udp.sockaddr = None then begin
+            Log.err (fun f -> f "DNS[%s] dropping response from unknown sockaddr" (tidstr_of_dns dns));
+            Lwt.return `Error
+          end else begin
+            Lwt.return (`Result (Cstruct.sub buf 0 recv.Uwt.Udp.recv_len))
+          end
         ) (fun e ->
            Log.err (fun f -> f "DNS[%s] recv failed with %s" (tidstr_of_dns dns) (Printexc.to_string e));
            Lwt.return `Error
         ) in
-    let timeout = Lwt_unix.sleep 5. >>= fun () -> Lwt.return `Timeout in
+    let timeout = Uwt.Timer.sleep 5000 >>= fun () -> Lwt.return `Timeout in
     Lwt.pick [ receiver; timeout ]
     >>= fun r ->
-    Lwt_unix.close fd
-    >>= fun () ->
+    let _ = Uwt.Udp.close fd in
+    (* FIXME(djs55): some result here *)
     match r with
     | `Error ->
       Lwt.return_unit

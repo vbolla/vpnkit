@@ -14,7 +14,7 @@ module Datagram = struct
 
   type flow = {
     description: string;
-    fd: Lwt_unix.file_descr;
+    fd: Uwt.Udp.t;
     mutable last_use: float;
     (* For protocols like NTP the source port keeps changing, so we send
        replies to the last source port we saw. *)
@@ -26,7 +26,7 @@ module Datagram = struct
 
   let _ =
     let rec loop () =
-      Lwt_unix.sleep 60.
+      Uwt.Timer.sleep 60_000
       >>= fun () ->
       let snapshot = Hashtbl.copy table in
       let now = Unix.gettimeofday () in
@@ -35,7 +35,9 @@ module Datagram = struct
             Log.debug (fun f -> f "Socket.Datagram %s: expiring UDP NAT rule" flow.description);
             Lwt.async (fun () ->
               Lwt.catch (fun () ->
-                Lwt_unix.close flow.fd
+                let _ = Uwt.Udp.close flow.fd in
+                (* FIXME(djs55): error handling *)
+                Lwt.return ()
               ) (fun e ->
                 Log.err (fun f -> f "Socket.Datagram %s: caught %s while closing UDP socket" flow.description (Printexc.to_string e));
                 Lwt.return ()
@@ -58,25 +60,34 @@ module Datagram = struct
          Lwt.return None
        end else begin
          Log.debug (fun f -> f "Socket.Datagram.input %s: creating UDP NAT rule" description);
-         let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 in
-         Lwt_unix.bind fd (Lwt_unix.ADDR_INET(Unix.inet_addr_any, 0));
+         let fd = Uwt.Udp.init () in
+         let sockaddr =
+           let unix = Unix.ADDR_INET(Unix.inet_addr_any, 0) in
+           (* FIXME(djs55): another possible exception *)
+           Uwt_base.Conv.of_unix_sockaddr_exn unix in
+          (* FIXME(djs55): exceptions *)
+         Uwt.Udp.bind_exn fd ~addr:sockaddr ();
          let last_use = Unix.gettimeofday () in
          let flow = { description; fd; last_use; reply} in
          Hashtbl.replace table (dst, dst_port) flow;
          (* Start a listener *)
-         let buffer = Cstruct.create 1500 in
-         let bytes = Bytes.make 1500 '\000' in
+         let buf = Cstruct.create 1500 in
          let rec loop () =
            Lwt.catch
              (fun () ->
-                (* Lwt on Win32 doesn't support Lwt_bytes.recvfrom *)
-                Lwt_unix.recvfrom fd bytes 0 (String.length bytes) []
-                >>= fun (n, _) ->
-                Cstruct.blit_from_string bytes 0 buffer 0 n;
-                let response = Cstruct.sub buffer 0 n in
-                flow.reply response
-                >>= fun () ->
-                Lwt.return true
+                Uwt.Udp.recv_ba ~pos:buf.Cstruct.off ~len:buf.Cstruct.len ~buf:buf.Cstruct.buffer fd
+                >>= fun recv ->
+                if recv.Uwt.Udp.is_partial then begin
+                  Log.err (fun f -> f "Socket.Datagram.input %s: dropping partial response" description);
+                  Lwt.return true
+                end else if recv.Uwt.Udp.sockaddr = None then begin
+                  Log.err (fun f -> f "Socket.Datagram.input %s: dropping response from unknown sockaddr" description);
+                  Lwt.return true
+                end else begin
+                  flow.reply (Cstruct.sub buf 0 recv.Uwt.Udp.recv_len)
+                  >>= fun () ->
+                  Lwt.return true
+                end
              ) (function
                  | Unix.Unix_error(Unix.EBADF, _, _) ->
                    (* fd has been closed by the GC *)
@@ -98,12 +109,10 @@ module Datagram = struct
       flow.reply <- reply;
       Lwt.catch
         (fun () ->
-           (* Lwt on Win32 doesn't support Lwt_bytes.sendto *)
-           let payload_string = Cstruct.to_string payload in
-           Lwt_unix.sendto flow.fd payload_string 0 (String.length payload_string) [] remote_sockaddr
-           >>= fun n ->
-           if n <> payload.Cstruct.len
-           then Log.err (fun f -> f "Socket.Datagram.input %s: Lwt_bytes.send short: expected %d got %d" flow.description payload.Cstruct.len n);
+           (* FIXME(djs55): of_unix_sockaddr_exn *)
+           let remote_sockaddr = Uwt_base.Conv.of_unix_sockaddr_exn remote_sockaddr in
+           Uwt.Udp.send_ba ~pos:payload.Cstruct.off ~len:payload.Cstruct.len ~buf:payload.Cstruct.buffer flow.fd remote_sockaddr
+           >>= fun () ->
            flow.last_use <- Unix.gettimeofday ();
            Lwt.return ()
         ) (fun e ->
@@ -117,7 +126,7 @@ module Stream = struct
 
   type flow = {
     description: string;
-    fd: Lwt_unix.file_descr;
+    fd: Uwt.Tcp.t;
     read_buffer_size: int;
     mutable read_buffer: Cstruct.t;
     mutable closed: bool;
@@ -138,35 +147,30 @@ module Stream = struct
     { description; fd; read_buffer; read_buffer_size; closed }
 
   let connect_v4 ?(read_buffer_size = 65536) ip port =
-    let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
+    let fd = Uwt.Tcp.init () in
     let description = Ipaddr.V4.to_string ip ^ ":" ^ (string_of_int port) in
     Lwt.catch
       (fun () ->
          Log.debug (fun f -> f "Socket.TCPV4.connect_v4 %s: connecting" description);
-         Lwt_unix.connect fd (Unix.ADDR_INET (Unix.inet_addr_of_string @@ Ipaddr.V4.to_string ip, port))
+         let sockaddr =
+           let unix = Unix.ADDR_INET (Unix.inet_addr_of_string @@ Ipaddr.V4.to_string ip, port) in
+           Uwt_base.Conv.of_unix_sockaddr_exn unix in
+         Uwt.Tcp.connect fd ~addr:sockaddr
          >>= fun () ->
          Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
       )
       (fun e ->
-         Lwt_unix.close fd
-         >>= fun () ->
+         (* FIXME(djs55): error handling *)
+         let _ = Uwt.Tcp.close fd in
          errorf "Socket.TCPV4.connect_v4 %s: Lwt_unix.connect: caught %s" description (Printexc.to_string e)
       )
 
-  let shutdown_read { description; fd; closed; _ } =
-    try
-      if not closed then Lwt_unix.shutdown fd Unix.SHUTDOWN_RECEIVE;
-      Lwt.return ()
-    with
-    | Unix.Unix_error(Unix.ENOTCONN, _, _) -> Lwt.return ()
-    | e ->
-      Log.err (fun f -> f "Socket.TCPV4.shutdown_read %s: caught %s returning Eof" description (Printexc.to_string e));
-      Lwt.return ()
+  let shutdown_read _ =
+    Lwt.return ()
 
   let shutdown_write { description; fd; closed; _ } =
     try
-      if not closed then Lwt_unix.shutdown fd Unix.SHUTDOWN_SEND;
-      Lwt.return ()
+      if not closed then Uwt.Tcp.shutdown fd else Lwt.return ()
     with
     | Unix.Unix_error(Unix.ENOTCONN, _, _) -> Lwt.return ()
     | e ->
@@ -177,7 +181,7 @@ module Stream = struct
     (if Cstruct.len t.read_buffer = 0 then t.read_buffer <- Cstruct.create t.read_buffer_size);
     Lwt.catch
       (fun () ->
-         Lwt_bytes.read t.fd t.read_buffer.Cstruct.buffer t.read_buffer.Cstruct.off t.read_buffer.Cstruct.len
+         Uwt.Tcp.read_ba ~pos:t.read_buffer.Cstruct.off ~len:t.read_buffer.Cstruct.len t.fd ~buf:t.read_buffer.Cstruct.buffer
          >>= function
          | 0 -> Lwt.return `Eof
          | n ->
@@ -192,7 +196,7 @@ module Stream = struct
   let write t buf =
     Lwt.catch
       (fun () ->
-         Lwt_cstruct.(complete (write t.fd) buf)
+         Uwt.Tcp.write_ba ~pos:buf.Cstruct.off ~len:buf.Cstruct.len t.fd ~buf:buf.Cstruct.buffer
          >>= fun () ->
          Lwt.return (`Ok ())
       ) (fun e ->
@@ -206,7 +210,7 @@ module Stream = struct
          let rec loop = function
            | [] -> Lwt.return (`Ok ())
            | buf :: bufs ->
-             Lwt_cstruct.(complete (write t.fd) buf)
+             Uwt.Tcp.write_ba ~pos:buf.Cstruct.off ~len:buf.Cstruct.len t.fd ~buf:buf.Cstruct.buffer
              >>= fun () ->
              loop bufs in
          loop bufs
@@ -218,7 +222,9 @@ module Stream = struct
   let close t =
     if not t.closed then begin
       t.closed <- true;
-      Lwt_unix.close t.fd
+      (* FIXME(djs55): errors *)
+      let _ = Uwt.Tcp.close t.fd in
+      Lwt.return ()
     end else Lwt.return ()
 
   (* FLOW boilerplate *)

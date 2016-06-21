@@ -1,3 +1,5 @@
+open Uwt_compat
+
 module type CONN = sig
   include Mirage_flow_s.SHUTDOWNABLE
 

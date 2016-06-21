@@ -52,23 +52,9 @@ module TCPV4_half_close = struct
   let write fd buf = handle_epipe (fun () -> write fd buf)
   let writev fd bufs = handle_epipe (fun () -> writev fd bufs)
 
-  let shutdown_write fd =
-    try
-      Lwt_unix.shutdown fd Unix.SHUTDOWN_SEND;
-      Lwt.return ()
-    with
-    | Unix.Unix_error(Unix.ENOTCONN, _, _) -> Lwt.return ()
-    | e ->
-      Log.err (fun f -> f "Socket_stack.TCPV4.shutdown_write: caught %s returning Eof" (Printexc.to_string e));
-      Lwt.return ()
+  let shutdown_write _ =
+    Log.err (fun f -> f "Socket_stack.shutdown_write unimplemented");
+    failwith "Socket_stack.shutdown_write unimplemented"
 
-  let shutdown_read fd =
-    try
-      Lwt_unix.shutdown fd Unix.SHUTDOWN_RECEIVE;
-      Lwt.return ()
-    with
-    | Unix.Unix_error(Unix.ENOTCONN, _, _) -> Lwt.return ()
-    | e ->
-      Log.err (fun f -> f "Socket_stack.TCPV4.shutdown_read: caught %s returning Eof" (Printexc.to_string e));
-      Lwt.return ()
+  let shutdown_read _ = Lwt.return ()
 end

@@ -1,4 +1,5 @@
 open Lwt.Infix
+open Uwt_compat
 
 let src =
   let src = Logs.Src.create "port forward" ~doc:"forward local ports to the VM" in
@@ -7,7 +8,7 @@ let src =
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let log_exception_continue description f =
+let _log_exception_continue description f =
   Lwt.catch
     (fun () -> f ())
     (fun e ->
@@ -93,7 +94,7 @@ let to_string t = Printf.sprintf "%s:%s" (Port.to_string t.local) (Port.to_strin
 
 let description_of_format = "'<tcp|udp>:local ip:local port:remote vchan port'"
 
-let finally f g =
+let _finally f g =
   Lwt.catch (fun () ->
     f ()
     >>= fun r ->
@@ -129,9 +130,12 @@ let bind local =
     >>= fun () ->
     Binder.bind local_ip local_port false
 
-let start_tcp_proxy vsock_path_var _local_ip _local_port t =
+let start_tcp_proxy _vsock_path_var _local_ip _local_port _t =
   (* Resolve the local port yet (the fds are already bound, we assume
      to the same port number even if on different IPs *)
+  Log.err (fun f -> f "Forward.start_tcp_proxy unimplemented");
+  failwith "Forward.start_tcp_proxy unimplemented"
+(*
   List.iter (fun fd ->
     match t.local, Lwt_unix.getsockname fd with
     | `Tcp (local_ip, 0), Lwt_unix.ADDR_INET(_, local_port) ->
@@ -205,12 +209,13 @@ let start_tcp_proxy vsock_path_var _local_ip _local_port t =
         loop fd in
     List.iter (fun fd -> Lwt.async @@ fun () -> loop fd) t.fds;
     Lwt.return (Result.Ok t)
+*)
 
-let max_udp_length = 2048 (* > 1500 the MTU of our link + header *)
+let _max_udp_length = 2048 (* > 1500 the MTU of our link + header *)
 
-let max_vsock_header_length = 1024
+let _max_vsock_header_length = 1024
 
-let conn_read flow buf =
+let _conn_read flow buf =
   let open Lwt.Infix in
   Connector.read_into flow buf
   >>= function
@@ -218,7 +223,7 @@ let conn_read flow buf =
   | `Error e -> Lwt.fail (Failure (Connector.error_message e))
   | `Ok () -> Lwt.return ()
 
-let conn_write flow buf =
+let _conn_write flow buf =
   let open Lwt.Infix in
   Connector.write flow buf
   >>= function
@@ -226,7 +231,10 @@ let conn_write flow buf =
   | `Error e -> Lwt.fail (Failure (Connector.error_message e))
   | `Ok () -> Lwt.return ()
 
-let start_udp_proxy vsock_path_var _local_ip _local_port t =
+let start_udp_proxy _vsock_path_var _local_ip _local_port _t =
+  Log.err (fun f -> f "Forward.start_udp_proxy unimplemented");
+  failwith "Forward.start_udp_proxy unimplemented"
+(*
   let open Lwt.Infix in
   let description = to_string t in
   let from_internet_string = Bytes.make max_udp_length '\000' in
@@ -353,6 +361,7 @@ let start_udp_proxy vsock_path_var _local_ip _local_port t =
     Connector.close v in
   List.iter (fun fd -> Lwt.async @@ fun () -> log_exception_continue "udp handle" @@ fun () -> handle fd) t.fds;
   Lwt.return (Result.Ok t)
+*)
 
 let start vsock_path_var t =
   bind t.local
