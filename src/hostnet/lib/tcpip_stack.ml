@@ -41,7 +41,7 @@ let make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip =
     let i32 = to_int32 highest in
     of_int32 @@ Int32.succ i32, of_int32 @@ Int32.succ @@ Int32.succ i32 in
   let prefix = smallest_prefix peer_ip [ local_ip; low_ip; high_ip ] 32 in
-  (* 
+  (*
   let config ~config =
     Dhcp_server.Config.parse (dhcp_conf ~config) [(config.local_ip,
     config.server_macaddr)] *)
@@ -164,14 +164,17 @@ let or_error name m =
   | `Ok x -> Lwt.return (`Ok x)
 
 let connect ~config (ppp: Vmnet.t) =
+  Log.info (fun f -> f "Tcpip_stack.connect");
   let open Infix in
   let valid_sources = [ config.peer_ip; Ipaddr.V4.of_string_exn "0.0.0.0" ] in
   let arp_table = [
     config.peer_ip, config.client_macaddr;
     config.local_ip, config.server_macaddr;
   ] in
+  Log.info (fun f -> f "Tcp_stack.connect: about to Netif.connect");
   or_error "filter" @@ Netif.connect ~valid_sources ppp
   >>= fun interface ->
+  Log.info (fun f -> f "Tcp_stack.connect: Netif.connect ok");
   or_error "console" @@ Console_unix.connect "0"
   >>= fun console ->
   or_error "ethernet" @@ Ethif1.connect interface
@@ -191,8 +194,10 @@ let connect ~config (ppp: Vmnet.t) =
     interface;
     mode = `IPv4 (config.local_ip, netmask, []);
   } in
+  Log.info (fun f -> f "Tcp_stack.connect: calling other connect");
   or_error "stack" @@ connect cfg ethif arp ipv4 udp4 tcp4
   >>= fun stack ->
+  Log.info (fun f -> f "Tcp_stack.connect: other connect ok");
   (* Hook in the DHCP server too *)
   Netif.add_listener interface (Dhcp.listen config.server_macaddr config interface);
   Lwt.return (`Ok stack)

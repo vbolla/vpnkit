@@ -23,6 +23,7 @@ module Make(Input: Sig.VMNET) = struct
   }
 
   let connect ~valid_sources input =
+    Log.info (fun f -> f "Filter.connect");
     let stats = {
       rx_bytes = 0L; rx_pkts = 0l; tx_bytes = 0L; tx_pkts = 0l;
     } in
@@ -62,7 +63,9 @@ module Make(Input: Sig.VMNET) = struct
       end
     | _ -> next buf
 
-  let listen t callback = Input.listen t.input @@ filter t.valid_sources callback
+  let listen t callback =
+    Log.info (fun f -> f "Filter.listen");
+    Input.listen t.input @@ filter t.valid_sources callback
   let add_listener t callback = Input.add_listener t.input @@ filter t.valid_sources callback
 
   let mac t = Input.mac t.input

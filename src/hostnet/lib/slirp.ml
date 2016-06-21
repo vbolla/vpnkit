@@ -43,6 +43,7 @@ module Make(Vmnet: Sig.VMNET)(Resolv_conv: Sig.RESOLV_CONF) = struct
   module Dns_forward = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conv)
 
 let connect x peer_ip local_ip =
+  Log.info (fun f -> f "Slirp.connect");
   let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip in
         begin Tcpip_stack.connect ~config x
         >>= function
@@ -191,6 +192,8 @@ let connect x peer_ip local_ip =
                         )
                     ))
             );
+            Log.info (fun f -> f "Slirp.connect: handlers setup, about to call listen");
+
             Tcpip_stack.listen s
             >>= fun () ->
             Log.info (fun f -> f "TCP/IP ready");

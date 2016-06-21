@@ -132,6 +132,7 @@ let main_t socket_path port_control_path vsock_path _db_path nofile =
     pcap_settings = Active_config.Value(None, never) } in
   with_pipe_accept s
     (fun conn ->
+      Log.info (fun f -> f "Accepted connection on %s" socket_path);
       ignore(Slirp_stack.connect stack conn)
     );
   wait ()
