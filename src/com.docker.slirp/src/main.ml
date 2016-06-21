@@ -65,12 +65,6 @@ let start_port_forwarding port_control_path vsock_path =
   let module Ports = Active_list.Make(Forward) in
   let module Server = Protocol_9p.Server.Make(Log)(Conn_uwt_pipe)(Ports) in
   let fs = Ports.make () in
-  Socket_stack.connect ()
-  >>= function
-  | `Error (`Msg m) ->
-    Log.err (fun f -> f "Failed to create a socket stack: %s" m);
-    exit 1
-  | `Ok _ ->
   Ports.set_context fs vsock_path;
   listen port_control_path
   >>= fun port_s ->
@@ -90,6 +84,12 @@ let start_port_forwarding port_control_path vsock_path =
             )
         )
     );
+  Socket_stack.connect ()
+  >>= function
+  | `Error (`Msg m) ->
+    Log.err (fun f -> f "Failed to create a socket stack: %s" m);
+    exit 1
+  | `Ok _ ->
   Lwt.return ()
 
 module Slirp_stack = Slirp.Make(Vmnet.Make(Conn_uwt_pipe))(Resolv_conf)
