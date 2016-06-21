@@ -10,7 +10,7 @@ let home = try Sys.getenv "HOME" with Not_found -> "/Users/root"
 let vsock_path = ref (home / "Library/Containers/com.docker.docker/Data/@connect")
 let _vsock_port = 62373l
 
-include Hostnet.Conn_lwt_unix
+include Conn_uwt_pipe
 
 type port = Hostnet.Forward.Port.t
 
