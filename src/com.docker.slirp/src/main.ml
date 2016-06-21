@@ -84,12 +84,7 @@ let start_port_forwarding port_control_path vsock_path =
             )
         )
     );
-  Socket_stack.connect ()
-  >>= function
-  | `Error (`Msg m) ->
-    Log.err (fun f -> f "Failed to create a socket stack: %s" m);
-    exit 1
-  | `Ok _ ->
+  Log.debug (fun f -> f "Skipping the socket_stack");
   Lwt.return ()
 
 module Slirp_stack = Slirp.Make(Vmnet.Make(Conn_uwt_pipe))(Resolv_conf)
