@@ -102,7 +102,7 @@ let set_nofile nofile =
   try Sys_resource_unix.setrlimit NOFILE ~soft ~hard with
   | Errno.Error ex -> Log.warn (fun f -> f "setrlimit failed: %s" (Errno.string_of_error ex))
 
-let main_t socket_path port_control_path vsock_path db_path nofile =
+let main_t socket_path port_control_path vsock_path _db_path nofile =
   Log.info (fun f -> f "Setting handler to ignore all SIGPIPE signals");
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   set_nofile nofile;
@@ -117,9 +117,12 @@ let main_t socket_path port_control_path vsock_path db_path nofile =
   >>= fun s ->
   start_port_forwarding port_control_path vsock_path
   >>= fun () ->
-  let config = Active_config.create "unix" db_path in
-  Slirp_stack.create config
-  >>= fun stack ->
+  (* FIXME(djs55): database connection *)
+  Log.warn (fun f -> f "no database: using hardcoded network configuration values");
+  let never, _ = Lwt.task () in
+  let stack = { Slirp_stack.peer_ip = Ipaddr.V4.of_string_exn "192.168.65.2";
+    local_ip = Ipaddr.V4.of_string_exn "192.168.65.1";
+    pcap_settings = Active_config.Value(None, never) } in
   with_pipe_accept s
     (fun conn ->
       ignore(Slirp_stack.connect stack conn)
