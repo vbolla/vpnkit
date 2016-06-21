@@ -102,6 +102,18 @@ let set_nofile nofile =
   try Sys_resource_unix.setrlimit NOFILE ~soft ~hard with
   | Errno.Error ex -> Log.warn (fun f -> f "setrlimit failed: %s" (Errno.string_of_error ex))
 
+let wait () =
+  let signals = [ Sys.sigint; Sys.sigterm ] in
+  let sleeper,waker = Lwt.task () in
+  let wake_once = lazy (Lwt.wakeup waker () ) in
+  let cb _sig _i  = Lazy.force wake_once  in
+  let l = List.map ( fun s -> Uwt.Signal.start_exn s ~cb ) signals in
+  let close_all () = List.iter Uwt.Signal.close_noerr l; Lwt.return_unit in
+  Log.info (fun f -> f "Waiting forever for SIGINT or SIGTERM");
+  Lwt.finalize
+    ( fun () -> sleeper )
+    ( fun () -> close_all () )
+
 let main_t socket_path port_control_path vsock_path _db_path nofile =
   Log.info (fun f -> f "Setting handler to ignore all SIGPIPE signals");
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
@@ -127,7 +139,7 @@ let main_t socket_path port_control_path vsock_path _db_path nofile =
     (fun conn ->
       ignore(Slirp_stack.connect stack conn)
     );
-  Lwt.return ()
+  wait ()
 
 let main socket port_control vsock_path db nofile debug =
   Osx_reporter.install ~stdout:debug;
