@@ -1,0 +1,13 @@
+diff --git a/src/OMakefile b/src/OMakefile
+index 2528142..03816cd 100644
+--- a/src/OMakefile
++++ b/src/OMakefile
+@@ -11,7 +11,7 @@ if $(equal $(OSTYPE),Win32)
+ 		else
+ 			touch configure config.h.in
+ 	config.h config.inc: config.h.in configure config.inc.in
+-		bash.exe configure CC="$(OCAMLC_CC)" CFLAGS="$(CFLAGS) $(CFLAGS_LIBUV)"  LDFLAGS="$(LDFLAGS) $(LDFLAGS_LIBUV)"
++		bash.exe configure CC="$(OCAMLC_CC)" CFLAGS="$(CFLAGS) $(CFLAGS_LIBUV)"  LDFLAGS="$(LDFLAGS) $(LDFLAGS_LIBUV)" || (cat config.log; exit 1)
+ else
+ 	configure config.h.in: configure.ac
+ 		if $(or $(not $(file-exists configure)),$(not $(file-exists config.h.in)))
