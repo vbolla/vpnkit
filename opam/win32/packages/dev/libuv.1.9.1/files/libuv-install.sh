@@ -10,18 +10,21 @@ LIBDIR="$PREFIX/lib/"
 INCLUDEDIR="$PREFIX/include/libuv"
 
 mkdir -p "$LIBDIR"
-ranlib libuv.a
+ls -l libuv.a
+/usr/bin/x86_64-w64-mingw32-ranlib.exe libuv.a
+ls -l libuv.a
 cp libuv.a "$LIBDIR"
+ls -l "$LIBDIR"
 mkdir -p "$INCLUDEDIR"
 cp include/*.h "$INCLUDEDIR"
 mkdir -p "$PKG_CONFIG_PATH"
 cp libuv.pc "$PKG_CONFIG_PATH"
 echo Examining /usr/local/lib
 ls -l /usr/local/lib
-which nm
-nm /usr/local/lib/libuv.a
-ar -x /usr/local/lib/libuv.a
+/usr/bin/x86_64-w64-mingw32-nm.exe /usr/local/lib/libuv.a
+/usr/bin/x86_64-w64-mingw32-ar.exe -x /usr/local/lib/libuv.a
 for i in *.o
 do
 file $i
+/usr/bin/x86_64-w64-mingw32-nm.exe $i
 done
