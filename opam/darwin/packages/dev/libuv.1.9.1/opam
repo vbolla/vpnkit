@@ -14,5 +14,5 @@ depends: [
   "conf-pkg-config"
 ]
 depexts: [
-  [["osx" "homebrew"] ["autoconf" "automake" "pkg-config"]]
+  [["osx" "homebrew"] ["autoconf" "automake" "pkg-config" "libtool"]]
 ]
