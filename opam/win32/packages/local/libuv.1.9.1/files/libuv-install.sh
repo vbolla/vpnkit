@@ -16,3 +16,7 @@ mkdir -p "$INCLUDEDIR"
 cp include/*.h "$INCLUDEDIR"
 mkdir -p "$PKG_CONFIG_PATH"
 cp libuv.pc "$PKG_CONFIG_PATH"
+echo Examining /usr/local/lib
+ls -l /usr/local/lib
+nm /usr/local/lib/libuv.a
+
