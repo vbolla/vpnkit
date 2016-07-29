@@ -247,8 +247,7 @@ end
 
 let main socket port_control max_connections vsock_path db_path dns pcap select debug =
   let module Use_lwt_unix = Main(Host_lwt_unix) in
-  let module Use_uwt = Main(Host_uwt) in
-  (if select then Use_lwt_unix.main else Use_uwt.main)
+  (if select then Use_lwt_unix.main else Use_lwt_unix.main)
     socket port_control max_connections vsock_path db_path dns pcap debug
 
 open Cmdliner
