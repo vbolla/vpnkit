@@ -76,6 +76,7 @@ let proxy named_pipe =
       | Some (vmid, serviceid) ->
         hvsock_connect (Hvsock.Id vmid) serviceid
         >>= fun hv ->
+        Log.info (fun f -> f "Connected to %s %s" vmid serviceid);
         Lwt.finalize
           (fun () ->
             let module RemoteChannel = Channel.Make(HV) in
@@ -117,7 +118,7 @@ let proxy named_pipe =
         Lwt.return_unit
     ) 
 
-let main_t ethernet_pipe_name port_pipe_name =
+let main_t pipe_name =
   Logs.set_reporter (Logs_fmt.reporter ());
   Printexc.record_backtrace true;
 
@@ -128,34 +129,23 @@ let main_t ethernet_pipe_name port_pipe_name =
     )
   );
 
-  Lwt.async (fun () ->
-    log_exception_continue "ethernet proxy"
-      (fun () ->
-        proxy ethernet_pipe_name
-      )
-  );
-  log_exception_continue "port proxy"
+  log_exception_continue "proxy"
     (fun () ->
-      proxy port_pipe_name 
+      proxy pipe_name 
     )
+
+let main pipe_name =
+  Lwt_main.run (main_t pipe_name)
 
 open Cmdliner
 
-let ethernet =
+let pipe =
   let doc =
     Arg.info ~doc:
-      "The address on the host for the VM ethernet connection."
-    [ "ethernet" ]
+      "The address on the host for HV socket forwards."
+    [ "pipe" ]
   in
-  Arg.(value & opt string "\\\\.\\pipe\\dockerethernet" doc)
-
-let port =
-  let doc =
-    Arg.info ~doc:
-      "The address on the host for the VM port forwarding."
-    [ "port" ]
-  in
-  Arg.(value & opt string "\\\\.\\pipe\\dockerport" doc)
+  Arg.(value & opt string "\\\\.\\pipe\\dockerhvproxy" doc)
 
 let command =
   let doc = "proxy Named pipe connections over Hyper-V sockets" in
@@ -163,7 +153,7 @@ let command =
     [`S "DESCRIPTION";
      `P "Accepts named pipe connections forever and forwards to the VM"]
   in
-  Term.(pure main_t $ ethernet $ port),
+  Term.(pure main $ pipe),
   Term.info (Filename.basename Sys.argv.(0)) ~version:"None" ~doc ~man
 
 let () =
