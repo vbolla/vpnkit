@@ -65,9 +65,11 @@ let proxy named_pipe =
     (fun fd ->
       let module LocalChannel = Channel.Make(Flow_lwt_unix) in
       let local = LocalChannel.create (Flow_lwt_unix.connect fd) in
+(*
       LocalChannel.write_line local "Enter address to connect using 'VMuuid-SERVICEuuid\\n'";
       LocalChannel.flush local
       >>= fun () ->
+*)
       LocalChannel.read_line local
       >>= fun bufs ->
       let message = String.trim (String.concat ~sep:"" (List.map Cstruct.to_string bufs)) in

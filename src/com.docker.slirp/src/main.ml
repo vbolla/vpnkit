@@ -78,8 +78,6 @@ let pipe_connect_forever url vmid serviceid callback =
         let flow = Flow_lwt_unix.connect fd in
         let module C = Channel.Make(Flow_lwt_unix) in
         let ch = C.create flow in
-        C.read_line ch
-        >>= fun _ ->
         C.write_line ch (vmid ^ "." ^ serviceid);
         C.flush ch
         >>= fun () ->
