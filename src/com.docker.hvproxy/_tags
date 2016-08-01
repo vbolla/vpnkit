@@ -1,0 +1,12 @@
+true : bin_annot, safe_string, package(bytes)
+true: warn_error(+1..49), warn(A-3-4-41-44)
+
+<src>: include
+
+true: package(named-pipe.lwt)
+true: package(cmdliner)
+true: package(hvsock.lwt-unix), package(fmt)
+true: thread, package(lwt.preemptive)
+true: package(astring), package(protocol-9p.unix)
+true: package(lwt), package(logs), package(logs.fmt)
+
