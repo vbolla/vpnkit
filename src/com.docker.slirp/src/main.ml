@@ -30,14 +30,14 @@ let ports_serviceid = "0B95756A-9985-48AD-9470-78E060895BE7"
 
 let hvsock_addr_of_uri ~default_serviceid uri =
   (* hyperv://vmid/serviceid *)
-  let vmid = match Uri.host uri with None -> Hvsock.Loopback | Some x -> Hvsock.Id x in
+  let vmid = match Uri.host uri with None -> failwith "loopback not supported" | Some x -> x in
   let serviceid =
     let p = Uri.path uri in
     if p = ""
     then default_serviceid
     (* trim leading / *)
     else if String.length p > 0 then String.sub p 1 (String.length p - 1) else p in
-    { Hvsock.vmid; serviceid }
+    vmid, serviceid
 
 module Main(Host: Sig.HOST) = struct
 
@@ -48,7 +48,6 @@ module Resolv_conf = Resolv_conf.Make(Host.Files)
 module Config = Active_config.Make(Host.Time)(Host.Sockets.Stream.Unix)
 module Forward_unix = Forward.Make(Connect_unix)(Bind)
 module Forward_hvsock = Forward.Make(Connect_hvsock)(Bind)
-module HV = Flow_lwt_hvsock.Make(Host.Time)(Host.Main)
 
 let file_descr_of_int (x: int) : Unix.file_descr =
   if Sys.os_type <> "Unix"
@@ -69,24 +68,26 @@ let unix_listen path =
     Lwt.return (Host.Sockets.Stream.Unix.of_bound_fd fd)
   end else Host.Sockets.Stream.Unix.bind path
 
-let hvsock_connect_forever url sockaddr callback =
-  Log.info (fun f -> f "connecting to %s:%s" (Hvsock.string_of_vmid sockaddr.Hvsock.vmid) sockaddr.Hvsock.serviceid);
+let pipe_connect_forever url vmid serviceid callback =
+  Log.info (fun f -> f "connecting to %s.%s" vmid serviceid);
   let rec aux () =
-    let socket = HV.Hvsock.create () in
     Lwt.catch
       (fun () ->
-        HV.Hvsock.connect socket sockaddr
+        Named_pipe_lwt.Client.openpipe url
+        >>= fun t ->
+        Log.info (fun f -> f "pipe connected successfully");
+        let fd = Named_pipe_lwt.Client.to_fd t in
+        let flow = Flow_lwt_unix.connect fd in
+        let module C = Channel.Make(Flow_lwt_unix) in
+        let ch = C.create flow in
+        C.read_line ch
+        >>= fun _ ->
+        C.write_line ch (vmid ^ "." ^ serviceid);
+        C.flush ch
         >>= fun () ->
-        Log.info (fun f -> f "hvsock connected successfully");
-        callback socket
+        callback fd
       ) (function
-        | Unix.Unix_error(_, _, _) ->
-          HV.Hvsock.close socket
-          >>= fun () ->
-          Host.Time.sleep 1.
         | _ ->
-          HV.Hvsock.close socket
-          >>= fun () ->
           Host.Time.sleep 1.
       )
     >>= fun () ->
@@ -110,12 +111,11 @@ let start_port_forwarding port_control_url max_connections vsock_path =
     let module Ports = Active_list.Make(Forward_hvsock) in
     let fs = Ports.make () in
     Ports.set_context fs "";
-    let module Server = Protocol_9p.Server.Make(Log9P)(HV)(Ports) in
-    let sockaddr = hvsock_addr_of_uri ~default_serviceid:ports_serviceid uri in
-    Connect_hvsock.set_port_forward_addr sockaddr;
-    hvsock_connect_forever port_control_url sockaddr
+    let module Server = Protocol_9p.Server.Make(Log9P)(Flow_lwt_unix)(Ports) in
+    let vmid, serviceid = hvsock_addr_of_uri ~default_serviceid:ports_serviceid uri in
+    pipe_connect_forever "\\\\.\\pipe\\dockerport" vmid serviceid
       (fun fd ->
-        let flow = HV.connect fd in
+        let flow = Flow_lwt_unix.connect fd in
         Server.connect fs flow ()
         >>= function
         | Result.Error (`Msg m) ->
@@ -202,11 +202,11 @@ let main_t socket_url port_control_url max_connections vsock_path db_path dns pc
   let uri = Uri.of_string socket_url in
   match Uri.scheme uri with
   | Some "hyperv-connect" ->
-    let module Slirp_stack = Slirp.Make(Config)(Vmnet.Make(HV))(Resolv_conf)(Host) in
-    let sockaddr = hvsock_addr_of_uri ~default_serviceid:ethernet_serviceid (Uri.of_string socket_url) in
-    hvsock_connect_forever socket_url sockaddr
+    let module Slirp_stack = Slirp.Make(Config)(Vmnet.Make(Flow_lwt_unix))(Resolv_conf)(Host) in
+    let vmid, serviceid = hvsock_addr_of_uri ~default_serviceid:ethernet_serviceid (Uri.of_string socket_url) in
+    pipe_connect_forever "\\\\.\\pipe\\dockerethernet" vmid serviceid
       (fun fd ->
-        let conn = HV.connect fd in
+        let conn = Flow_lwt_unix.connect fd in
         ( match config with
           | Some config -> Slirp_stack.create config
           | None -> Lwt.return hardcoded_configuration )
