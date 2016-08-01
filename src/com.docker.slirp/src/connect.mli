@@ -7,9 +7,3 @@ module Make_unix(Host: Sig.HOST): sig
 
   val vsock_path: string ref
 end
-
-module Make_hvsock(Host: Sig.HOST): sig
-  include Sig.Connector
-
-  val set_max_connections: int option -> unit
-end

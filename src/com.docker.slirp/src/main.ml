@@ -42,12 +42,10 @@ let hvsock_addr_of_uri ~default_serviceid uri =
 module Main(Host: Sig.HOST) = struct
 
 module Connect_unix = Connect.Make_unix(Host)
-module Connect_hvsock = Connect.Make_hvsock(Host)
 module Bind = Bind.Make(Host.Sockets)
 module Resolv_conf = Resolv_conf.Make(Host.Files)
 module Config = Active_config.Make(Host.Time)(Host.Sockets.Stream.Unix)
 module Forward_unix = Forward.Make(Connect_unix)(Bind)
-module Forward_hvsock = Forward.Make(Connect_hvsock)(Bind)
 
 let file_descr_of_int (x: int) : Unix.file_descr =
   if Sys.os_type <> "Unix"
@@ -103,17 +101,16 @@ let start_port_forwarding port_control_url max_connections vsock_path =
   (* Start the 9P port forwarding server *)
   Connect_unix.vsock_path := vsock_path;
   Connect_unix.set_max_connections max_connections;
-  Connect_hvsock.set_max_connections max_connections;
 
   let uri = Uri.of_string port_control_url in
   match Uri.scheme uri with
   | Some "hyperv-connect" ->
-    let module Ports = Active_list.Make(Forward_hvsock) in
+    let module Ports = Active_list.Make(Forward_unix) in
     let fs = Ports.make () in
     Ports.set_context fs "";
     let module Server = Protocol_9p.Server.Make(Log9P)(Flow_lwt_unix)(Ports) in
     let vmid, serviceid = hvsock_addr_of_uri ~default_serviceid:ports_serviceid uri in
-    pipe_connect_forever "\\\\.\\pipe\\dockerport" vmid serviceid
+    pipe_connect_forever "\\\\.\\pipe\\dockerhvproxy" vmid serviceid
       (fun fd ->
         let flow = Flow_lwt_unix.connect fd in
         Server.connect fs flow ()
@@ -204,7 +201,7 @@ let main_t socket_url port_control_url max_connections vsock_path db_path dns pc
   | Some "hyperv-connect" ->
     let module Slirp_stack = Slirp.Make(Config)(Vmnet.Make(Flow_lwt_unix))(Resolv_conf)(Host) in
     let vmid, serviceid = hvsock_addr_of_uri ~default_serviceid:ethernet_serviceid (Uri.of_string socket_url) in
-    pipe_connect_forever "\\\\.\\pipe\\dockerethernet" vmid serviceid
+    pipe_connect_forever "\\\\.\\pipe\\dockerhvproxy" vmid serviceid
       (fun fd ->
         let conn = Flow_lwt_unix.connect fd in
         ( match config with
