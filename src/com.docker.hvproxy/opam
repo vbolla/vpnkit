@@ -56,6 +56,7 @@ depends: [
   "hvsock"
   "win-eventlog"
   "asl"
+  "uwt"
   "fd-send-recv" # to enable vmnet-client
   "ctypes" # to enable vmnet-client
 ]

@@ -21,7 +21,9 @@ let default d = function None -> d | Some x -> x
 let ethernet_serviceid = "30D48B34-7D27-4B0B-AAAF-BBBED334DD59"
 let ports_serviceid = "0B95756A-9985-48AD-9470-78E060895BE7"
 
-module HV = Flow_lwt_unix_hvsock
+module Host = Host_uwt
+
+module HV = Flow_lwt_hvsock.Make(Host.Time)(Host.Main)
 
 let rec hvsock_connect vmid serviceid =
   let sockaddr = { Hvsock.vmid; serviceid } in
@@ -35,36 +37,24 @@ let rec hvsock_connect vmid serviceid =
       | Unix.Unix_error(_, _, _) ->
         HV.Hvsock.close socket
         >>= fun () ->
-        Lwt_unix.sleep 1.
+        Host.Time.sleep 1.
         >>= fun () ->
         hvsock_connect vmid serviceid
       | _ ->
         HV.Hvsock.close socket
         >>= fun () ->
-        Lwt_unix.sleep 1.
+        Host.Time.sleep 1.
         >>= fun () ->
         hvsock_connect vmid serviceid
     )
 
-let rec named_pipe_accept_forever path callback =
-  let open Lwt.Infix in
-  let p = Named_pipe_lwt.Server.create path in
-  Named_pipe_lwt.Server.connect p >>= function
-  | false ->
-    Log.err (fun f -> f "Nmaed-pipe connection failed on %s" path);
-    Lwt.return ()
-  | true ->
-    let _ = (* background thread *)
-      let fd = Named_pipe_lwt.Server.to_fd p in
-      callback fd
-    in
-    named_pipe_accept_forever path callback
-
 let proxy named_pipe =
-  named_pipe_accept_forever named_pipe
+  Host.Sockets.Stream.Unix.bind named_pipe
+  >>= fun server ->
+  Host.Sockets.Stream.Unix.listen server
     (fun fd ->
-      let module LocalChannel = Channel.Make(Flow_lwt_unix) in
-      let local = LocalChannel.create (Flow_lwt_unix.connect fd) in
+      let module LocalChannel = Channel.Make(Host.Sockets.Stream.Unix) in
+      let local = LocalChannel.create fd in
 (*
       LocalChannel.write_line local "Enter address to connect using 'VMuuid-SERVICEuuid\\n'";
       LocalChannel.flush local
@@ -113,12 +103,13 @@ let proxy named_pipe =
           ) (fun () ->
             HV.Hvsock.close hv
             >>= fun () ->
-            Lwt_unix.close fd
+            Host.Sockets.Stream.Unix.close fd
           )
       | None ->
         Log.err (fun f -> f "Failed to parse request, expected VMID.SERVICEID");
         Lwt.return_unit
-    ) 
+    );
+  Lwt.return_unit
 
 let main_t pipe_name =
   Logs.set_reporter (Logs_fmt.reporter ());
@@ -131,13 +122,20 @@ let main_t pipe_name =
     )
   );
 
-  log_exception_continue "proxy"
-    (fun () ->
-      proxy pipe_name 
-    )
+  let rec loop () =
+    Log.info (fun f -> f ".");
+    Host.Time.sleep 1.
+    >>= fun () ->
+    loop () in
+  let _ = loop () in
+
+  proxy pipe_name
+  >>= fun () ->
+  let forever, _ = Lwt.task () in
+  forever
 
 let main pipe_name =
-  Lwt_main.run (main_t pipe_name)
+  Host.Main.run (main_t pipe_name)
 
 open Cmdliner
 
