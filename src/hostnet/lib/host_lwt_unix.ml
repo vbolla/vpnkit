@@ -19,13 +19,32 @@ let log_exception_continue description f =
 
 module Sockets = struct
 
+let max_connections = ref None
+
+let set_max_connections x = max_connections := x
+let active_connections = ref 0
+
+exception Too_many_connections
+
+let allocate_connection () = match !max_connections with
+  | Some m when !active_connections >= m ->
+    Log.err (fun f -> f "exceeded maximum number of forwarded connections (%d)" m);
+    Lwt.fail Too_many_connections
+  | _ ->
+    incr active_connections;
+    Lwt.return_unit
+
+let deallocate_connection () = decr active_connections
+
 let string_of_sockaddr = function
   | Lwt_unix.ADDR_INET(ip, port) -> Unix.string_of_inet_addr ip ^ ":" ^ (string_of_int port)
   | Lwt_unix.ADDR_UNIX path -> path
 
 let unix_bind_one pf ty ip port =
+  allocate_connection ()
+  >>= fun () ->
   let addr = Lwt_unix.ADDR_INET(Unix.inet_addr_of_string @@ Ipaddr.to_string ip, port) in
-  let fd = Lwt_unix.socket pf ty 0 in
+  let fd = try Lwt_unix.socket pf ty 0 with e -> deallocate_connection (); raise e in
   Lwt.catch
     (fun () ->
       Lwt_unix.setsockopt fd Lwt_unix.SO_REUSEADDR true;
@@ -34,6 +53,7 @@ let unix_bind_one pf ty ip port =
     ) (fun e ->
       Lwt_unix.close fd
       >>= fun () ->
+      deallocate_connection ();
       Lwt.fail e
     )
 
@@ -97,6 +117,9 @@ module Datagram = struct
             Lwt.async (fun () ->
               Lwt.catch (fun () ->
                 Lwt_unix.close flow.fd
+                >>= fun () ->
+                deallocate_connection ();
+                Lwt.return_unit
               ) (fun e ->
                 Log.err (fun f -> f "Socket.Datagram %s: caught %s while closing UDP socket" flow.description (Printexc.to_string e));
                 Lwt.return ()
@@ -122,8 +145,10 @@ module Datagram = struct
          Lwt.return None
        end else begin
          Log.debug (fun f -> f "Socket.Datagram.input %s: creating UDP NAT rule" description);
-         let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 in
-         Lwt_unix.bind fd (Lwt_unix.ADDR_INET(Unix.inet_addr_any, 0));
+         allocate_connection ()
+         >>= fun () ->
+         let fd = try Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 with e -> deallocate_connection (); raise e in
+         (try Lwt_unix.bind fd (Lwt_unix.ADDR_INET(Unix.inet_addr_any, 0)) with _ -> ());
          let last_use = Unix.gettimeofday () in
          let flow = { description; fd; last_use; reply} in
          Hashtbl.replace table (src, src_port) flow;
@@ -204,6 +229,9 @@ module Datagram = struct
       if not server.closed then begin
         server.closed <- true;
         Lwt_unix.close server.fd
+        >>= fun () ->
+        deallocate_connection ();
+        Lwt.return_unit
       end else Lwt.return_unit
 
     let recvfrom server buf =
@@ -341,12 +369,17 @@ module Stream = struct
       if not t.closed then begin
         t.closed <- true;
         Lwt_unix.close t.fd
+        >>= fun () ->
+        deallocate_connection ();
+        Lwt.return_unit
       end else Lwt.return ()
 
     let connect description ?(read_buffer_size = default_read_buffer_size) sock_domain sock_ty sockaddr =
       let fd = Lwt_unix.socket sock_domain sock_ty 0 in
       Lwt.catch
         (fun () ->
+           allocate_connection ()
+           >>= fun () ->
            Log.debug (fun f -> f "%s: connecting" description);
            Lwt_unix.connect fd sockaddr
            >>= fun () ->
@@ -355,6 +388,7 @@ module Stream = struct
         (fun e ->
            Lwt_unix.close fd
            >>= fun () ->
+           deallocate_connection ();
            errorf "%s: Lwt_unix.connect: caught %s" description (Printexc.to_string e)
         )
 
@@ -372,7 +406,13 @@ module Stream = struct
       let fds = server.listening_fds in
       server.listening_fds <- [];
       server.closed <- true;
-      Lwt_list.iter_s Lwt_unix.close fds
+      Lwt_list.iter_s
+        (fun fd ->
+          Lwt_unix.close fd
+          >>= fun () ->
+          deallocate_connection ();
+          Lwt.return_unit
+        ) fds
 
     let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
       make ~read_buffer_size [ Lwt_unix.of_unix_file_descr fd ]
@@ -389,7 +429,11 @@ module Stream = struct
             Lwt.finalize
               (fun () ->
                 log_exception_continue "Socket.Stream"
-                  (fun () -> cb flow)
+                  (fun () ->
+                    allocate_connection ()
+                    >>= fun () ->
+                    cb flow
+                  )
               ) (fun () -> close flow)
           );
         loop fd in
@@ -449,6 +493,8 @@ module Stream = struct
     let connect ?read_buffer_size path =
       let description = path in
       if is_win32 then begin
+        allocate_connection ()
+        >>= fun () ->
         Named_pipe_lwt.Client.openpipe path
         >>= fun p ->
         let fd = Named_pipe_lwt.Client.to_fd p in
@@ -469,6 +515,8 @@ module Stream = struct
             | Unix.Unix_error(Unix.ENOENT, _, _) -> Lwt.return ()
             | e -> Lwt.fail e)
         >>= fun () ->
+        allocate_connection ()
+        >>= fun () ->
         let s = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0 in
         Lwt.catch
           (fun () ->
@@ -477,6 +525,7 @@ module Stream = struct
           ) (fun e ->
             Lwt_unix.close s
             >>= fun () ->
+            deallocate_connection ();
             Lwt.fail e
           )
 
@@ -505,7 +554,11 @@ module Stream = struct
                     Lwt.finalize
                       (fun () ->
                         log_exception_continue "Socket.Stream.Unix"
-                          (fun () -> cb flow )
+                          (fun () ->
+                            allocate_connection ()
+                            >>= fun () ->
+                            cb flow
+                          )
                       ) (fun () -> close flow)
                   );
                 loop ()

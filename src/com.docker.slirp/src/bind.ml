@@ -22,6 +22,10 @@ module Make(Socket: Sig.SOCKETS) = struct
     c: Channel.t;
   }
 
+  let allocate_connection = Socket.allocate_connection
+  let deallocate_connection = Socket.deallocate_connection
+  let set_max_connections = Socket.set_max_connections
+
   module Infix = struct
     let ( >>= ) m f = m >>= function
       | `Ok x -> f x

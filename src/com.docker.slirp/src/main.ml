@@ -102,8 +102,7 @@ let start_port_forwarding port_control_url max_connections vsock_path =
     vsock_path);
   (* Start the 9P port forwarding server *)
   Connect_unix.vsock_path := vsock_path;
-  Connect_unix.set_max_connections max_connections;
-  Connect_hvsock.set_max_connections max_connections;
+  Host.Sockets.set_max_connections max_connections;
 
   let uri = Uri.of_string port_control_url in
   match Uri.scheme uri with

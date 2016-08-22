@@ -47,6 +47,23 @@ end
 
 module Sockets = struct
 
+  let max_connections = ref None
+
+  let set_max_connections x = max_connections := x
+  let active_connections = ref 0
+
+  exception Too_many_connections
+
+  let allocate_connection () = match !max_connections with
+    | Some m when !active_connections >= m ->
+      Log.err (fun f -> f "exceeded maximum number of forwarded connections (%d)" m);
+      Lwt.fail Too_many_connections
+    | _ ->
+      incr active_connections;
+      Lwt.return_unit
+
+  let deallocate_connection () = decr active_connections
+
   module Datagram = struct
     type reply = Cstruct.t -> unit Lwt.t
 
@@ -76,6 +93,7 @@ module Sockets = struct
             if now -. flow.last_use > 60. then begin
               Log.debug (fun f -> f "Socket.Datagram %s: expiring UDP NAT rule" flow.description);
               let result = Uwt.Udp.close flow.fd in
+              deallocate_connection ();
               if not(Uwt.Int_result.is_ok result)
               then Log.err (fun f -> f "Socket.Datagram %s: close returned %s" flow.description (Uwt.strerror (Uwt.Int_result.to_error result)));
               Hashtbl.remove table k
@@ -97,11 +115,14 @@ module Sockets = struct
            Lwt.return None
          end else begin
            Log.debug (fun f -> f "Socket.Datagram.input %s: creating UDP NAT rule" description);
+           allocate_connection ()
+           >>= fun () ->
            let fd = Uwt.Udp.init () in
            let sockaddr = make_sockaddr (Ipaddr.(V4 V4.any), 0) in
            let result = Uwt.Udp.bind ~mode:[ Uwt.Udp.Reuse_addr ] fd ~addr:sockaddr () in
            if not(Uwt.Int_result.is_ok result) then begin
              Log.err (fun f -> f "Socket.Datagram.input: bind returned %s" (Uwt.strerror (Uwt.Int_result.to_error result)));
+             deallocate_connection ();
              Lwt.return None
            end else begin
              let last_use = Unix.gettimeofday () in
@@ -135,7 +156,8 @@ module Sockets = struct
                        Lwt.return false
                    )
                >>= function
-               | false -> Lwt.return ()
+               | false ->
+                  Lwt.return ()
                | true -> loop () in
              Lwt.async loop;
              Lwt.return (Some flow)
@@ -172,11 +194,14 @@ module Sockets = struct
 
       let bind (ip, port) =
         let sockaddr = make_sockaddr(ip, port) in
+        allocate_connection ()
+        >>= fun () ->
         let fd = Uwt.Udp.init () in
         let result = Uwt.Udp.bind ~mode:[ Uwt.Udp.Reuse_addr ] fd ~addr:sockaddr () in
         if not(Uwt.Int_result.is_ok result) then begin
           let error = Uwt.Int_result.to_error result in
           Log.err (fun f -> f "Socket.Udp.bind(%s, %d): %s" (Ipaddr.to_string ip) port (Uwt.strerror error));
+          deallocate_connection ();
           Lwt.fail (Unix.Unix_error(Uwt.to_unix_error error, "bind", ""))
         end else Lwt.return { fd; closed = false }
 
@@ -201,6 +226,7 @@ module Sockets = struct
           if not(Uwt.Int_result.is_ok result) then begin
             Log.err (fun f -> f "Socket.Datagram: close returned %s" (Uwt.strerror (Uwt.Int_result.to_error result)));
           end;
+          deallocate_connection ();
         end;
         Lwt.return_unit
 
@@ -254,6 +280,8 @@ module Sockets = struct
         let description = Ipaddr.V4.to_string ip ^ ":" ^ (string_of_int port) in
         Lwt.catch
           (fun () ->
+             allocate_connection ()
+             >>= fun () ->
              let sockaddr = make_sockaddr (Ipaddr.V4 ip, port) in
              Uwt.Tcp.connect fd ~addr:sockaddr
              >>= fun () ->
@@ -262,6 +290,7 @@ module Sockets = struct
           (fun e ->
              (* FIXME(djs55): error handling *)
              let _ = Uwt.Tcp.close fd in
+             deallocate_connection ();
              errorf "Socket.Tcp.connect %s: caught %s" description (Printexc.to_string e)
           )
 
@@ -356,6 +385,8 @@ module Sockets = struct
           | _ -> invalid_arg "Tcp.getsockname passed a non-TCP socket"
 
       let bind_one (ip, port) =
+        allocate_connection ()
+        >>= fun () ->
         let fd = Uwt.Tcp.init () in
         let addr = make_sockaddr (ip, port) in
         let result = Uwt.Tcp.bind fd ~addr () in
@@ -363,6 +394,7 @@ module Sockets = struct
           let error = Uwt.Int_result.to_error result in
           let msg = Printf.sprintf "Socket.Tcp.bind(%s, %d): %s" (Ipaddr.to_string ip) port (Uwt.strerror error) in
           Log.err (fun f -> f "%s" msg);
+          deallocate_connection ();
           Lwt.fail (Unix.Unix_error(Uwt.to_unix_error error, "bind", ""))
         end else Lwt.return fd
 
@@ -406,7 +438,10 @@ module Sockets = struct
         let fds = server.listening_fds in
         server.listening_fds <- [];
         (* FIXME(djs55): errors *)
-        List.iter (fun fd -> ignore (Uwt.Tcp.close fd)) fds;
+        List.iter (fun fd ->
+          ignore (Uwt.Tcp.close fd);
+          deallocate_connection ()
+        ) fds;
         Lwt.return ()
 
       let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
@@ -433,7 +468,11 @@ module Sockets = struct
                                Lwt.finalize
                                  (fun () ->
                                     log_exception_continue "Socket.Stream"
-                                      (fun () -> cb flow)
+                                      (fun () ->
+                                        allocate_connection ()
+                                        >>= fun () ->
+                                        cb flow
+                                      )
                                  ) (fun () -> close flow)
                             )
                        )
@@ -467,6 +506,8 @@ module Sockets = struct
         fd
 
       let connect ?(read_buffer_size = default_read_buffer_size) path =
+        allocate_connection ()
+        >>= fun () ->
         let fd = Uwt.Pipe.init () in
         Uwt.Pipe.connect fd ~path
         >>= fun () ->
@@ -549,6 +590,7 @@ module Sockets = struct
           t.closed <- true;
           (* FIXME(djs55): errors *)
           let _ = Uwt.Pipe.close t.fd in
+          deallocate_connection ();
           Lwt.return ()
         end else Lwt.return ()
 
@@ -563,9 +605,17 @@ module Sockets = struct
              Uwt.Fs.unlink path
           ) (fun _ -> Lwt.return ())
         >>= fun () ->
+        allocate_connection ()
+        >>= fun () ->
         let fd = Uwt.Pipe.init () in
-        Uwt.Pipe.bind_exn fd ~path;
-        Lwt.return { fd; closed = false }
+        Lwt.catch
+          (fun () ->
+            Uwt.Pipe.bind_exn fd ~path;
+            Lwt.return { fd; closed = false }
+          ) (fun e ->
+            deallocate_connection ();
+            Lwt.fail e
+          )
 
       let listen { fd; _ } cb =
         Uwt.Pipe.listen_exn fd ~max:5 ~cb:(fun server x ->
@@ -579,14 +629,19 @@ module Sockets = struct
               end else begin
                 Lwt.async
                   (fun () ->
-                     log_exception_continue "Pipe.listen"
-                       (fun () ->
-                          let conn = of_fd ~description:"Pipe connection" client in
-                          cb conn
-                          >>= fun () ->
-                          ignore(Uwt.Pipe.close client);
-                          Lwt.return ()
-                       )
+                    Lwt.finalize
+                      (fun () ->
+                        log_exception_continue "Pipe.listen"
+                          (fun () ->
+                            let conn = of_fd ~description:"Pipe connection" client in
+                            allocate_connection ()
+                            >>= fun () ->
+                            cb conn
+                          )
+                      ) (fun () ->
+                        ignore(Uwt.Pipe.close client);
+                        Lwt.return ()
+                      )
                   )
               end
           )
@@ -603,7 +658,8 @@ module Sockets = struct
         if not server.closed then begin
           server.closed <- true;
           (* FIXME(djs55): errors *)
-          ignore(Uwt.Pipe.close server.fd)
+          ignore(Uwt.Pipe.close server.fd);
+          deallocate_connection ();
         end;
         Lwt.return ()
 
