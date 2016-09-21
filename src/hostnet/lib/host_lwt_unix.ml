@@ -22,6 +22,25 @@ module Sockets = struct
 let max_connections = ref None
 
 let set_max_connections x = max_connections := x
+
+let next_connection_idx =
+  let idx = ref 0 in
+  fun () ->
+    let next = !idx in
+    incr idx;
+    next
+
+let connection_table = Hashtbl.create 511
+let register_connection_no_limit description =
+  let idx = next_connection_idx () in
+  Hashtbl.replace connection_table idx description;
+  idx
+let register_connection description =
+  let idx = register_connection_no_limit description in
+  Lwt.return idx
+let deregister_connection idx =
+  Hashtbl.remove connection_table idx
+
 let active_connections = ref 0
 
 exception Too_many_connections
@@ -41,25 +60,30 @@ let string_of_sockaddr = function
   | Lwt_unix.ADDR_UNIX path -> path
 
 let unix_bind_one pf ty ip port =
-  allocate_connection ()
-  >>= fun () ->
+  let protocol = match pf, ty with
+    | Unix.PF_INET, Unix.SOCK_STREAM -> "tcp:"
+    | Unix.PF_INET, Unix.SOCK_DGRAM  -> "udp:"
+    | _, _ -> "unknown:" in
+  let description = protocol ^ (Ipaddr.to_string ip) ^ ":" ^ (string_of_int port) in
+  register_connection description
+  >>= fun idx ->
   let addr = Lwt_unix.ADDR_INET(Unix.inet_addr_of_string @@ Ipaddr.to_string ip, port) in
-  let fd = try Lwt_unix.socket pf ty 0 with e -> deallocate_connection (); raise e in
+  let fd = try Lwt_unix.socket pf ty 0 with e -> deregister_connection idx; raise e in
   Lwt.catch
     (fun () ->
       Lwt_unix.setsockopt fd Lwt_unix.SO_REUSEADDR true;
       Lwt_unix.bind fd addr;
-      Lwt.return fd
+      Lwt.return (idx, fd)
     ) (fun e ->
       Lwt_unix.close fd
       >>= fun () ->
-      deallocate_connection ();
+      deregister_connection idx;
       Lwt.fail e
     )
 
 let unix_bind ty (local_ip, local_port) =
   unix_bind_one Lwt_unix.PF_INET ty Ipaddr.(V4 local_ip) local_port
-  >>= fun fd ->
+  >>= fun (idx, fd) ->
   let local_port = match local_port, Lwt_unix.getsockname fd with
     | 0, Unix.ADDR_INET(_, local_port) -> local_port
     | 0, _ -> assert false (* common only uses ADDR_INET *)
@@ -74,8 +98,8 @@ let unix_bind ty (local_ip, local_port) =
       then begin
         Log.info (fun f -> f "attempting a best-effort bind of ::1:%d" local_port);
         unix_bind_one Lwt_unix.PF_INET6 ty Ipaddr.(V6 V6.localhost) local_port
-        >>= fun fd ->
-        Lwt.return [ fd ]
+        >>= fun (idx, fd) ->
+        Lwt.return [ idx, fd ]
       end else begin
         Lwt.return []
       end
@@ -84,12 +108,13 @@ let unix_bind ty (local_ip, local_port) =
       Lwt.return []
     )
   >>= fun extra ->
-  Lwt.return (fd :: extra)
+  Lwt.return ((idx, fd) :: extra)
 
 module Datagram = struct
   type reply = Cstruct.t -> unit Lwt.t
 
   type flow = {
+    idx: int;
     description: string;
     fd: Lwt_unix.file_descr;
     mutable last_use: float;
@@ -118,7 +143,7 @@ module Datagram = struct
               Lwt.catch (fun () ->
                 Lwt_unix.close flow.fd
                 >>= fun () ->
-                deallocate_connection ();
+                deregister_connection flow.idx;
                 Lwt.return_unit
               ) (fun e ->
                 Log.err (fun f -> f "Socket.Datagram %s: caught %s while closing UDP socket" flow.description (Printexc.to_string e));
@@ -145,12 +170,12 @@ module Datagram = struct
          Lwt.return None
        end else begin
          Log.debug (fun f -> f "Socket.Datagram.input %s: creating UDP NAT rule" description);
-         allocate_connection ()
-         >>= fun () ->
-         let fd = try Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 with e -> deallocate_connection (); raise e in
+         register_connection description
+         >>= fun idx ->
+         let fd = try Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM 0 with e -> deregister_connection idx; raise e in
          (try Lwt_unix.bind fd (Lwt_unix.ADDR_INET(Unix.inet_addr_any, 0)) with _ -> ());
          let last_use = Unix.gettimeofday () in
-         let flow = { description; fd; last_use; reply} in
+         let flow = { idx; description; fd; last_use; reply} in
          Hashtbl.replace table (src, src_port) flow;
          (* Start a listener *)
          let buffer = Cstruct.create 1500 in
@@ -205,19 +230,26 @@ module Datagram = struct
   module Udp = struct
 
     type server = {
+      idx: int;
       fd: Lwt_unix.file_descr;
       mutable closed: bool;
     }
 
-    let make fd = { fd; closed = false }
+    let make ~idx fd = { idx; fd; closed = false }
 
     let bind (ip, port) =
       unix_bind_one Lwt_unix.PF_INET Lwt_unix.SOCK_DGRAM ip port
-      >>= fun fd ->
-      Lwt.return (make fd)
+      >>= fun (idx, fd) ->
+      Lwt.return (make ~idx fd)
 
     let of_bound_fd fd =
-      make (Lwt_unix.of_unix_file_descr fd)
+      let description = match Unix.getsockname fd with
+        | Lwt_unix.ADDR_INET(iaddr, port) ->
+          "udp:" ^ (Unix.string_of_inet_addr iaddr) ^ ":" ^ (string_of_int port)
+        | _ ->
+          "unknown:" in
+      let idx = register_connection_no_limit description in
+      make ~idx (Lwt_unix.of_unix_file_descr fd)
 
     let getsockname { fd; _ } =
       match Lwt_unix.getsockname fd with
@@ -230,7 +262,7 @@ module Datagram = struct
         server.closed <- true;
         Lwt_unix.close server.fd
         >>= fun () ->
-        deallocate_connection ();
+        deregister_connection server.idx;
         Lwt.return_unit
       end else Lwt.return_unit
 
@@ -265,6 +297,7 @@ module Stream = struct
   (* Using Lwt_unix we share an implementation across various transport types *)
   module Fd = struct
     type flow = {
+      idx: int;
       description: string;
       fd: Lwt_unix.file_descr;
       read_buffer_size: int;
@@ -281,10 +314,10 @@ module Stream = struct
 
     let errorf fmt = Printf.ksprintf (fun s -> Lwt.return (`Error (`Msg s))) fmt
 
-    let of_fd ?(read_buffer_size = default_read_buffer_size) ~description fd =
+    let of_fd ~idx ?(read_buffer_size = default_read_buffer_size) ~description fd =
       let read_buffer = Cstruct.create read_buffer_size in
       let closed = false in
-      { description; fd; read_buffer; read_buffer_size; closed }
+      { idx; description; fd; read_buffer; read_buffer_size; closed }
 
     let shutdown_read { description; fd; closed; _ } =
       try
@@ -370,30 +403,30 @@ module Stream = struct
         t.closed <- true;
         Lwt_unix.close t.fd
         >>= fun () ->
-        deallocate_connection ();
+        deregister_connection t.idx;
         Lwt.return_unit
       end else Lwt.return ()
 
     let connect description ?(read_buffer_size = default_read_buffer_size) sock_domain sock_ty sockaddr =
+      register_connection description
+      >>= fun idx ->
       let fd = Lwt_unix.socket sock_domain sock_ty 0 in
       Lwt.catch
         (fun () ->
-           allocate_connection ()
-           >>= fun () ->
            Log.debug (fun f -> f "%s: connecting" description);
            Lwt_unix.connect fd sockaddr
            >>= fun () ->
-           Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
+           Lwt.return (`Ok (of_fd ~idx ~read_buffer_size ~description fd))
         )
         (fun e ->
            Lwt_unix.close fd
            >>= fun () ->
-           deallocate_connection ();
+           deregister_connection idx;
            errorf "%s: Lwt_unix.connect: caught %s" description (Printexc.to_string e)
         )
 
     type server = {
-      mutable listening_fds: Lwt_unix.file_descr list;
+      mutable listening_fds: (int * Lwt_unix.file_descr) list;
       read_buffer_size: int;
       path: string; (* only for Win32 *)
       mutable closed: bool;
@@ -407,15 +440,21 @@ module Stream = struct
       server.listening_fds <- [];
       server.closed <- true;
       Lwt_list.iter_s
-        (fun fd ->
+        (fun (idx, fd) ->
           Lwt_unix.close fd
           >>= fun () ->
-          deallocate_connection ();
+          deregister_connection idx;
           Lwt.return_unit
         ) fds
 
     let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
-      make ~read_buffer_size [ Lwt_unix.of_unix_file_descr fd ]
+      let description = match Unix.getsockname fd with
+        | Lwt_unix.ADDR_INET(iaddr, port) ->
+          "udp:" ^ (Unix.string_of_inet_addr iaddr) ^ ":" ^ (string_of_int port)
+        | _ ->
+          "unknown:" in
+      let idx = register_connection_no_limit description in
+      make ~read_buffer_size [ idx, Lwt_unix.of_unix_file_descr fd ]
 
     let listen server cb =
       let rec loop fd =
@@ -423,22 +462,33 @@ module Stream = struct
         >>= fun (client, sockaddr) ->
         let read_buffer_size = server.read_buffer_size in
         let description = string_of_sockaddr sockaddr in
-        let flow = of_fd ~read_buffer_size ~description client in
+
         Lwt.async
-          (fun () ->
+         (fun () ->
+           Lwt.catch
+             (fun () ->
+               register_connection description
+               >>= fun idx ->
+               Lwt.return (Some (of_fd ~idx ~read_buffer_size ~description client))
+             ) (fun _e ->
+               Lwt_unix.close client
+               >>= fun () ->
+               Lwt.return_none
+             )
+           >>= function
+           | None -> Lwt.return_unit
+           | Some flow ->
             Lwt.finalize
               (fun () ->
                 log_exception_continue "Socket.Stream"
                   (fun () ->
-                    allocate_connection ()
-                    >>= fun () ->
                     cb flow
                   )
               ) (fun () -> close flow)
-          );
+        );
         loop fd in
       List.iter
-        (fun fd ->
+        (fun (_idx, fd) ->
           Lwt.async
             (fun () ->
               log_exception_continue "Socket.Stream"
@@ -476,7 +526,7 @@ module Stream = struct
 
     let getsockname server = match server.listening_fds with
       | [] -> failwith "Tcp.getsockname: socket is closed"
-      | fd :: _ ->
+      | (_idx, fd) :: _ ->
         match Lwt_unix.getsockname fd with
         | Lwt_unix.ADDR_INET(iaddr, port) ->
           Ipaddr.V4.of_string_exn (Unix.string_of_inet_addr iaddr), port
@@ -491,20 +541,21 @@ module Stream = struct
     let is_win32 = Sys.os_type = "win32"
 
     let connect ?read_buffer_size path =
-      let description = path in
+      let description = "unix:" ^ path in
       if is_win32 then begin
-        allocate_connection ()
-        >>= fun () ->
+        register_connection description
+        >>= fun idx ->
         Named_pipe_lwt.Client.openpipe path
         >>= fun p ->
         let fd = Named_pipe_lwt.Client.to_fd p in
-        Lwt.return (`Ok (of_fd ?read_buffer_size ~description fd))
+        Lwt.return (`Ok (of_fd ~idx ?read_buffer_size ~description fd))
       end else begin
         let sockaddr = Unix.ADDR_UNIX path in
         connect description ?read_buffer_size Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM sockaddr
       end
 
     let bind path =
+      let description = "unix:" ^ path in
       if is_win32
       then Lwt.return (make ~path [])
       else
@@ -515,17 +566,17 @@ module Stream = struct
             | Unix.Unix_error(Unix.ENOENT, _, _) -> Lwt.return ()
             | e -> Lwt.fail e)
         >>= fun () ->
-        allocate_connection ()
-        >>= fun () ->
+        register_connection description
+        >>= fun idx ->
         let s = Lwt_unix.socket Lwt_unix.PF_UNIX Lwt_unix.SOCK_STREAM 0 in
         Lwt.catch
           (fun () ->
             Lwt_unix.bind s (Lwt_unix.ADDR_UNIX path);
-            Lwt.return (make ~path [ s ])
+            Lwt.return (make ~path [ idx, s ])
           ) (fun e ->
             Lwt_unix.close s
             >>= fun () ->
-            deallocate_connection ();
+            deregister_connection idx;
             Lwt.fail e
           )
 
@@ -548,19 +599,29 @@ module Stream = struct
                 let description = "named-pipe:" ^ server.path in
                 let read_buffer_size = server.read_buffer_size in
                 let fd = Named_pipe_lwt.Server.to_fd p in
-                let flow = of_fd ~read_buffer_size ~description fd in
-                Lwt.async
+                Lwt.catch
                   (fun () ->
-                    Lwt.finalize
-                      (fun () ->
-                        log_exception_continue "Socket.Stream.Unix"
-                          (fun () ->
-                            allocate_connection ()
-                            >>= fun () ->
-                            cb flow
-                          )
-                      ) (fun () -> close flow)
-                  );
+                    register_connection description
+                    >>= fun idx ->
+                    Lwt.return (Some (of_fd ~idx ~read_buffer_size ~description fd))
+                  ) (fun _e ->
+                    Lwt_unix.close fd
+                    >>= fun () ->
+                    Lwt.return None
+                  )
+                 >>= function
+                 | None -> Lwt.return_unit
+                 | Some flow ->
+                  Lwt.async
+                    (fun () ->
+                      Lwt.finalize
+                        (fun () ->
+                          log_exception_continue "Socket.Stream.Unix"
+                            (fun () ->
+                              cb flow
+                            )
+                        ) (fun () -> close flow)
+                    );
                 loop ()
             end in
         Lwt.async
