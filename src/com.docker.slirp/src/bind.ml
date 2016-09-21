@@ -59,26 +59,35 @@ module Make(Socket: Sig.SOCKETS) = struct
     >>= fun () ->
     let rawfd = Socket.Stream.Unix.unsafe_get_raw_fd t.fd in
     let result = String.make 8 '\000' in
-    let n, _, fd = Fd_send_recv.recv_fd rawfd result 0 8 [] in
-    if n <> 8 then Lwt.return (`Error (`Msg (Printf.sprintf "Message only contained %d bytes" n))) else begin
-      let buf = Cstruct.create 8 in
-      Cstruct.blit_from_string result 0 buf 0 8;
-      Log.debug (fun f ->
-          let b = Buffer.create 16 in
-          Cstruct.hexdump_to_buffer b buf;
-          f "received result bytes: %s which is %s" (String.escaped result) (Buffer.contents b)
-        );
-      match Cstruct.LE.get_uint64 buf 0 with
-      | 0L -> Lwt.return (`Ok fd)
-      | n ->
-        Unix.close fd;
-        begin match n with
-          | 48L -> Lwt.return (`Error (`Msg "EADDRINUSE"))
-          | 49L -> Lwt.return (`Error (`Msg "EADDRNOTAVAIL"))
-          | n   ->
-            Lwt.return (`Error (`Msg ("Failed to bind: unrecognised errno: " ^ (Int64.to_string n))))
-        end
-    end
+    Socket.allocate_connection ()
+    >>= fun () ->
+    let n, _, fd = try Fd_send_recv.recv_fd rawfd result 0 8 [] with e -> Socket.deallocate_connection (); raise e in
+
+    ( if n <> 8 then Lwt.return (`Error (`Msg (Printf.sprintf "Message only contained %d bytes" n))) else begin
+        let buf = Cstruct.create 8 in
+        Cstruct.blit_from_string result 0 buf 0 8;
+        Log.debug (fun f ->
+            let b = Buffer.create 16 in
+            Cstruct.hexdump_to_buffer b buf;
+            f "received result bytes: %s which is %s" (String.escaped result) (Buffer.contents b)
+          );
+        match Cstruct.LE.get_uint64 buf 0 with
+        | 0L -> Lwt.return (`Ok fd)
+        | n ->
+          begin match n with
+            | 48L -> Lwt.return (`Error (`Msg "EADDRINUSE"))
+            | 49L -> Lwt.return (`Error (`Msg "EADDRNOTAVAIL"))
+            | n   ->
+              Lwt.return (`Error (`Msg ("Failed to bind: unrecognised errno: " ^ (Int64.to_string n))))
+          end
+      end )
+    >>= function
+    | `Error x ->
+      Unix.close fd;
+      Socket.deallocate_connection ();
+      Lwt.return (`Error x)
+    | `Ok x ->
+      Lwt.return (`Ok x)
 
   (* This implementation is OSX-only *)
   let request_privileged_port local_ip local_port sock_stream =
