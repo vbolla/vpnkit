@@ -510,10 +510,16 @@ module Sockets = struct
         allocate_connection ()
         >>= fun () ->
         let fd = Uwt.Pipe.init () in
-        Uwt.Pipe.connect fd ~path
-        >>= fun () ->
-        let description = path in
-        Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
+        Lwt.catch
+          (fun () ->
+            Uwt.Pipe.connect fd ~path
+            >>= fun () ->
+            let description = path in
+            Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
+          ) (fun e ->
+            deallocate_connection ();
+            Lwt.fail e
+          )
 
       let shutdown_read _ =
         Lwt.return ()
