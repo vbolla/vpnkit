@@ -529,6 +529,7 @@ module Sockets = struct
       type address = string
 
       type flow = {
+        idx: int;
         description: string;
         fd: Uwt.Pipe.t;
         read_buffer_size: int;
@@ -536,10 +537,10 @@ module Sockets = struct
         mutable closed: bool;
       }
 
-      let of_fd ?(read_buffer_size = default_read_buffer_size) ~description fd =
+      let of_fd ~idx ?(read_buffer_size = default_read_buffer_size) ~description fd =
         let read_buffer = Cstruct.create read_buffer_size in
         let closed = false in
-        { description; fd; read_buffer; read_buffer_size; closed }
+        { idx; description; fd; read_buffer; read_buffer_size; closed }
 
       let unsafe_get_raw_fd t =
         let fd = Uwt.Pipe.fileno_exn t.fd in
@@ -547,17 +548,18 @@ module Sockets = struct
         fd
 
       let connect ?(read_buffer_size = default_read_buffer_size) path =
-        allocate_connection ()
-        >>= fun () ->
+        let description = "unix:" ^ path in
+        register_connection description
+        >>= fun idx ->
         let fd = Uwt.Pipe.init () in
         Lwt.catch
           (fun () ->
             Uwt.Pipe.connect fd ~path
             >>= fun () ->
             let description = path in
-            Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
+            Lwt.return (`Ok (of_fd ~idx ~read_buffer_size ~description fd))
           ) (fun e ->
-            deallocate_connection ();
+            deregister_connection idx;
             Lwt.fail e
           )
 
@@ -637,11 +639,12 @@ module Sockets = struct
           t.closed <- true;
           (* FIXME(djs55): errors *)
           let _ = Uwt.Pipe.close t.fd in
-          deallocate_connection ();
+          deregister_connection t.idx;
           Lwt.return ()
         end else Lwt.return ()
 
       type server = {
+        idx: int;
         fd: Uwt.Pipe.t;
         mutable closed: bool;
       }
@@ -652,19 +655,25 @@ module Sockets = struct
              Uwt.Fs.unlink path
           ) (fun _ -> Lwt.return ())
         >>= fun () ->
-        allocate_connection ()
-        >>= fun () ->
+        let description = "unix:" ^ path in
+        register_connection description
+        >>= fun idx ->
         let fd = Uwt.Pipe.init () in
         Lwt.catch
           (fun () ->
             Uwt.Pipe.bind_exn fd ~path;
-            Lwt.return { fd; closed = false }
+            Lwt.return { idx; fd; closed = false }
           ) (fun e ->
-            deallocate_connection ();
+            deregister_connection idx;
             Lwt.fail e
           )
 
-      let listen { fd; _ } cb =
+      let getsockname server = match Uwt.Pipe.getsockname server.fd with
+        | Uwt.Ok path ->
+          path
+        | _ -> invalid_arg "Unix.sockname passed a non-Unix socket"
+
+      let listen ({ fd; _ } as server') cb =
         Uwt.Pipe.listen_exn fd ~max:5 ~cb:(fun server x ->
             if Uwt.Int_result.is_error x then
               ignore(Uwt_io.printl "listen error")
@@ -676,26 +685,38 @@ module Sockets = struct
               end else begin
                 Lwt.async
                   (fun () ->
-                    Lwt.finalize
+                    Lwt.catch
                       (fun () ->
-                        log_exception_continue "Pipe.listen"
-                          (fun () ->
-                            let conn = of_fd ~description:"Pipe connection" client in
-                            allocate_connection ()
-                            >>= fun () ->
-                            cb conn
-                          )
-                      ) (fun () ->
-                        ignore(Uwt.Pipe.close client);
-                        Lwt.return ()
+                        let description = getsockname server' in
+                        register_connection description
+                        >>= fun idx ->
+                        Lwt.return (Some (of_fd ~idx ~description client))
+                      ) (fun _e ->
+                        ignore (Uwt.Pipe.close client);
+                        Lwt.return_none
                       )
+                    >>= function
+                    | None -> Lwt.return_unit
+                    | Some flow ->
+                      Lwt.finalize
+                        (fun () ->
+                          log_exception_continue "Pipe.listen"
+                            (fun () ->
+                              cb flow
+                            )
+                        ) (fun () -> close flow )
                   )
               end
           )
 
       let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
         match Uwt.Pipe.openpipe fd with
-        | Uwt.Ok fd -> { fd; closed = false }
+        | Uwt.Ok fd ->
+          let description = match Uwt.Pipe.getsockname fd with
+            | Uwt.Ok path -> "unix:" ^ path
+            | Uwt.Error error -> "getsockname failed: " ^ (Uwt.strerror error) in
+          let idx = register_connection_no_limit description in
+          { idx; fd; closed = false }
         | Uwt.Error error ->
           let msg = Printf.sprintf "Socket.Pipe.of_bound_fd (read_buffer_size=%d) failed with %s" read_buffer_size (Uwt.strerror error) in
           Log.err (fun f -> f "%s" msg);
@@ -706,14 +727,11 @@ module Sockets = struct
           server.closed <- true;
           (* FIXME(djs55): errors *)
           ignore(Uwt.Pipe.close server.fd);
-          deallocate_connection ();
+          deregister_connection server.idx;
         end;
         Lwt.return ()
 
-      let getsockname server = match Uwt.Pipe.getsockname server.fd with
-        | Uwt.Ok path ->
-          path
-        | _ -> invalid_arg "Unix.sockname passed a non-Unix socket"
+
 
 
     end
