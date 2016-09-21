@@ -50,6 +50,25 @@ module Sockets = struct
   let max_connections = ref None
 
   let set_max_connections x = max_connections := x
+
+  let next_connection_idx =
+    let idx = ref 0 in
+    fun () ->
+      let next = !idx in
+      incr idx;
+      next
+
+  let connection_table = Hashtbl.create 511
+  let register_connection_no_limit description =
+    let idx = next_connection_idx () in
+    Hashtbl.replace connection_table idx description;
+    idx
+  let register_connection description =
+    let idx = register_connection_no_limit description in
+    Lwt.return idx
+  let deregister_connection idx =
+    Hashtbl.remove connection_table idx
+
   let active_connections = ref 0
 
   exception Too_many_connections
@@ -263,6 +282,7 @@ module Sockets = struct
       type address = Ipaddr.V4.t * int
 
       type flow = {
+        idx: int;
         description: string;
         fd: Uwt.Tcp.t;
         read_buffer_size: int;
@@ -270,27 +290,27 @@ module Sockets = struct
         mutable closed: bool;
       }
 
-      let of_fd ?(read_buffer_size = default_read_buffer_size) ~description fd =
+      let of_fd ~idx ?(read_buffer_size = default_read_buffer_size) ~description fd =
         let read_buffer = Cstruct.create read_buffer_size in
         let closed = false in
-        { description; fd; read_buffer; read_buffer_size; closed }
+        { idx; description; fd; read_buffer; read_buffer_size; closed }
 
       let connect ?(read_buffer_size = default_read_buffer_size) (ip, port) =
+        let description = "tcp:" ^ (Ipaddr.V4.to_string ip) ^ ":" ^ (string_of_int port) in
+        register_connection description
+        >>= fun idx ->
         let fd = Uwt.Tcp.init () in
-        let description = Ipaddr.V4.to_string ip ^ ":" ^ (string_of_int port) in
         Lwt.catch
           (fun () ->
-             allocate_connection ()
-             >>= fun () ->
              let sockaddr = make_sockaddr (Ipaddr.V4 ip, port) in
              Uwt.Tcp.connect fd ~addr:sockaddr
              >>= fun () ->
-             Lwt.return (`Ok (of_fd ~read_buffer_size ~description fd))
+             Lwt.return (`Ok (of_fd ~idx ~read_buffer_size ~description fd))
           )
           (fun e ->
              (* FIXME(djs55): error handling *)
              let _ = Uwt.Tcp.close fd in
-             deallocate_connection ();
+             deregister_connection idx;
              errorf "Socket.Tcp.connect %s: caught %s" description (Printexc.to_string e)
           )
 
@@ -365,12 +385,12 @@ module Sockets = struct
           t.closed <- true;
           (* FIXME(djs55): errors *)
           let _ = Uwt.Tcp.close t.fd in
-          deallocate_connection ();
+          deregister_connection t.idx;
           Lwt.return ()
         end else Lwt.return ()
 
       type server = {
-        mutable listening_fds: Uwt.Tcp.t list;
+        mutable listening_fds: (int * Uwt.Tcp.t) list;
         read_buffer_size: int;
       }
 
@@ -379,15 +399,16 @@ module Sockets = struct
 
       let getsockname server = match server.listening_fds with
         | [] -> failwith "Tcp.getsockname: socket is closed"
-        | fd :: _ ->
+        | (_, fd) :: _ ->
           match Uwt.Tcp.getsockname_exn fd with
           | Unix.ADDR_INET(iaddr, port) ->
             Ipaddr.V4.of_string_exn (Unix.string_of_inet_addr iaddr), port
           | _ -> invalid_arg "Tcp.getsockname passed a non-TCP socket"
 
       let bind_one (ip, port) =
-        allocate_connection ()
-        >>= fun () ->
+        let description = "tcp:" ^ (Ipaddr.to_string ip) ^ ":" ^ (string_of_int port) in
+        register_connection description
+        >>= fun idx ->
         let fd = Uwt.Tcp.init () in
         let addr = make_sockaddr (ip, port) in
         let result = Uwt.Tcp.bind fd ~addr () in
@@ -395,13 +416,13 @@ module Sockets = struct
           let error = Uwt.Int_result.to_error result in
           let msg = Printf.sprintf "Socket.Tcp.bind(%s, %d): %s" (Ipaddr.to_string ip) port (Uwt.strerror error) in
           Log.err (fun f -> f "%s" msg);
-          deallocate_connection ();
+          deregister_connection idx;
           Lwt.fail (Unix.Unix_error(Uwt.to_unix_error error, "bind", ""))
-        end else Lwt.return fd
+        end else Lwt.return (idx, fd)
 
       let bind (ip, port) =
         bind_one (Ipaddr.V4 ip, port)
-        >>= fun fd ->
+        >>= fun (idx, fd) ->
         ( match Uwt.Tcp.getsockname fd with
           | Uwt.Ok sockaddr ->
             begin match ip_port_of_sockaddr sockaddr with
@@ -411,6 +432,7 @@ module Sockets = struct
           | Uwt.Error error ->
             let msg = Printf.sprintf "Socket.Tcp.bind(%s, %d): %s" (Ipaddr.V4.to_string ip) port (Uwt.strerror error) in
             Log.err (fun f -> f "%s" msg);
+            deregister_connection idx;
             Lwt.fail (Unix.Unix_error(Uwt.to_unix_error error, "bind", "")) )
         >>= fun local_port ->
         (* On some systems localhost will resolve to ::1 first and this can
@@ -423,8 +445,8 @@ module Sockets = struct
              then begin
                Log.info (fun f -> f "attempting a best-effort bind of ::1:%d" local_port);
                bind_one (Ipaddr.(V6 V6.localhost), local_port)
-               >>= fun fd ->
-               Lwt.return [ fd ]
+               >>= fun (idx, fd) ->
+               Lwt.return [ idx, fd ]
              end else begin
                Lwt.return []
              end
@@ -433,25 +455,26 @@ module Sockets = struct
               Lwt.return []
             )
         >>= fun extra ->
-        Lwt.return (make (fd :: extra))
+        Lwt.return (make ((idx, fd) :: extra))
 
       let shutdown server =
         let fds = server.listening_fds in
         server.listening_fds <- [];
         (* FIXME(djs55): errors *)
-        List.iter (fun fd ->
+        List.iter (fun (idx, fd) ->
           ignore (Uwt.Tcp.close fd);
-          deallocate_connection ()
+          deregister_connection idx
         ) fds;
         Lwt.return ()
 
       let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
         let fd = Uwt.Tcp.opentcp_exn fd in
-        make ~read_buffer_size [ fd ]
+        let idx = register_connection_no_limit "of_bound_fd" in
+        make ~read_buffer_size [ (idx, fd) ]
 
       let listen server cb =
         List.iter
-          (fun fd ->
+          (fun (_, fd) ->
              Uwt.Tcp.listen_exn fd ~max:32 ~cb:(fun server x ->
                  if Uwt.Int_result.is_error x then
                    ignore(Uwt_io.printl "listen error")
@@ -461,22 +484,39 @@ module Sockets = struct
                    if Uwt.Int_result.is_error t then begin
                      ignore(Uwt_io.printl "accept error");
                    end else begin
-                     let flow = of_fd ~description:"connected TCP" client in
+                     let description = match Uwt.Tcp.getpeername client with
+                       | Uwt.Ok sockaddr ->
+                         begin match ip_port_of_sockaddr sockaddr with
+                           | Some (Some ip, port) -> "tcp:" ^ (Ipaddr.to_string ip) ^ ":" ^ (string_of_int port)
+                           | _ -> "unknown incoming TCP"
+                         end
+                       | Uwt.Error error -> "getpeername failed: " ^ (Uwt.strerror error) in
+
                      Lwt.async
                        (fun () ->
-                          log_exception_continue "listen"
-                            (fun () ->
-                               Lwt.finalize
-                                 (fun () ->
-                                    log_exception_continue "Socket.Stream"
-                                      (fun () ->
-                                        allocate_connection ()
-                                        >>= fun () ->
-                                        cb flow
-                                      )
-                                 ) (fun () -> close flow)
-                            )
-                       )
+                         Lwt.catch
+                           (fun () ->
+                             register_connection description
+                             >>= fun idx ->
+                             Lwt.return (Some (of_fd ~idx ~description client))
+                           ) (fun _e ->
+                             ignore (Uwt.Tcp.close client);
+                             Lwt.return_none
+                           )
+                         >>= function
+                         | None -> Lwt.return_unit
+                         | Some flow ->
+                           log_exception_continue "listen"
+                             (fun () ->
+                                Lwt.finalize
+                                  (fun () ->
+                                     log_exception_continue "Socket.Stream"
+                                       (fun () ->
+                                         cb flow
+                                       )
+                                  ) (fun () -> close flow)
+                             )
+                      )
                    end
                );
           ) server.listening_fds
