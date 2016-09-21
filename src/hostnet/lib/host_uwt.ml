@@ -365,6 +365,7 @@ module Sockets = struct
           t.closed <- true;
           (* FIXME(djs55): errors *)
           let _ = Uwt.Tcp.close t.fd in
+          deallocate_connection ();
           Lwt.return ()
         end else Lwt.return ()
 
