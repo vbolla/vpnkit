@@ -44,7 +44,12 @@ module Make_unix(Host: Sig.HOST) = struct
 end
 
 module Make_hvsock(Host: Sig.HOST) = struct
-  include Flow_lwt_hvsock_shutdown.Make(Host.Time)(Host.Main)
+  module F = Flow_lwt_hvsock_shutdown.Make(Host.Time)(Host.Main)
+
+  type flow = {
+    idx: int;
+    flow: F.flow;
+  }
 
   type address = unit
 
@@ -53,18 +58,31 @@ module Make_hvsock(Host: Sig.HOST) = struct
   let set_port_forward_addr x = hvsockaddr := Some x
 
   let close flow =
-    Host.Sockets.deallocate_connection ();
-    close flow
+    Host.Sockets.deregister_connection flow.idx;
+    F.close flow.flow
 
   let connect () = match !hvsockaddr with
     | None ->
       Log.err (fun f -> f "Please set a Hyper-V socket address for port forwarding");
       failwith "Hyper-V socket forwarding not initialised"
     | Some sockaddr ->
-      Host.Sockets.allocate_connection ()
+      let description = "hvsock" in
+      Host.Sockets.register_connection description
+      >>= fun idx ->
+      let fd = F.Hvsock.create () in
+      F.Hvsock.connect fd sockaddr
       >>= fun () ->
-      let fd = Hvsock.create () in
-      Hvsock.connect fd sockaddr
-      >>= fun () ->
-      Lwt.return (connect fd)
+      let flow = F.connect fd in
+      Lwt.return { idx; flow }
+
+  let read_into t = F.read_into t.flow
+  let read t = F.read t.flow
+  let write t = F.write t.flow 
+  let writev t = F.writev t.flow
+  let shutdown_read t = F.shutdown_read t.flow
+  let shutdown_write t = F.shutdown_write t.flow
+  let error_message = F.error_message
+  type 'a io = 'a F.io
+  type buffer = F.buffer
+  type error = F.error
 end
