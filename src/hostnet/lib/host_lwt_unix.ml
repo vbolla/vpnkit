@@ -30,30 +30,22 @@ let next_connection_idx =
     incr idx;
     next
 
+exception Too_many_connections
+
 let connection_table = Hashtbl.create 511
 let register_connection_no_limit description =
   let idx = next_connection_idx () in
   Hashtbl.replace connection_table idx description;
   idx
-let register_connection description =
-  let idx = register_connection_no_limit description in
-  Lwt.return idx
-let deregister_connection idx =
-  Hashtbl.remove connection_table idx
-
-let active_connections = ref 0
-
-exception Too_many_connections
-
-let allocate_connection () = match !max_connections with
-  | Some m when !active_connections >= m ->
+let register_connection description = match !max_connections with
+  | Some m when Hashtbl.length connection_table >= m ->
     Log.err (fun f -> f "exceeded maximum number of forwarded connections (%d)" m);
     Lwt.fail Too_many_connections
   | _ ->
-    incr active_connections;
-    Lwt.return_unit
-
-let deallocate_connection () = decr active_connections
+    let idx = register_connection_no_limit description in
+    Lwt.return idx
+let deregister_connection idx =
+  Hashtbl.remove connection_table idx
 
 let string_of_sockaddr = function
   | Lwt_unix.ADDR_INET(ip, port) -> Unix.string_of_inet_addr ip ^ ":" ^ (string_of_int port)

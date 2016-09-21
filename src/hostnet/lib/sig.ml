@@ -79,8 +79,8 @@ module type SOCKETS = sig
       is to prevent starving global OS resources, particularly on OSX *)
 
   (** TODO: hide these by refactoring Hyper-V sockets stuff *)
-  val allocate_connection: unit -> unit Lwt.t
-  val deallocate_connection: unit -> unit
+  val register_connection: string -> int Lwt.t
+  val deregister_connection: int -> unit
 
   module Datagram: sig
 
