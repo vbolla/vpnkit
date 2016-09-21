@@ -87,6 +87,7 @@ module Sockets = struct
     type reply = Cstruct.t -> unit Lwt.t
 
     type flow = {
+      idx: int;
       description: string;
       fd: Uwt.Udp.t;
       mutable last_use: float;
@@ -112,7 +113,7 @@ module Sockets = struct
             if now -. flow.last_use > 60. then begin
               Log.debug (fun f -> f "Socket.Datagram %s: expiring UDP NAT rule" flow.description);
               let result = Uwt.Udp.close flow.fd in
-              deallocate_connection ();
+              deregister_connection flow.idx;
               if not(Uwt.Int_result.is_ok result)
               then Log.err (fun f -> f "Socket.Datagram %s: close returned %s" flow.description (Uwt.strerror (Uwt.Int_result.to_error result)));
               Hashtbl.remove table k
@@ -134,18 +135,18 @@ module Sockets = struct
            Lwt.return None
          end else begin
            Log.debug (fun f -> f "Socket.Datagram.input %s: creating UDP NAT rule" description);
-           allocate_connection ()
-           >>= fun () ->
+           register_connection description
+           >>= fun idx ->
            let fd = Uwt.Udp.init () in
            let sockaddr = make_sockaddr (Ipaddr.(V4 V4.any), 0) in
            let result = Uwt.Udp.bind ~mode:[ Uwt.Udp.Reuse_addr ] fd ~addr:sockaddr () in
            if not(Uwt.Int_result.is_ok result) then begin
              Log.err (fun f -> f "Socket.Datagram.input: bind returned %s" (Uwt.strerror (Uwt.Int_result.to_error result)));
-             deallocate_connection ();
+             deregister_connection idx;
              Lwt.return None
            end else begin
              let last_use = Unix.gettimeofday () in
-             let flow = { description; fd; last_use; reply} in
+             let flow = { idx; description; fd; last_use; reply} in
              Hashtbl.replace table (src, src_port) flow;
              (* Start a listener *)
              let buf = Cstruct.create 1500 in
@@ -205,28 +206,39 @@ module Sockets = struct
       include Common
 
       type server = {
+        idx: int;
         fd: Uwt.Udp.t;
         mutable closed: bool;
       }
 
-      let make fd = { fd; closed = false }
+      let make ~idx fd = { idx; fd; closed = false }
 
       let bind (ip, port) =
+        let description = "udp:" ^ (Ipaddr.to_string ip) ^ ":" ^ (string_of_int port) in
         let sockaddr = make_sockaddr(ip, port) in
-        allocate_connection ()
-        >>= fun () ->
+        register_connection description
+        >>= fun idx ->
         let fd = Uwt.Udp.init () in
         let result = Uwt.Udp.bind ~mode:[ Uwt.Udp.Reuse_addr ] fd ~addr:sockaddr () in
         if not(Uwt.Int_result.is_ok result) then begin
           let error = Uwt.Int_result.to_error result in
           Log.err (fun f -> f "Socket.Udp.bind(%s, %d): %s" (Ipaddr.to_string ip) port (Uwt.strerror error));
-          deallocate_connection ();
+          deregister_connection idx;
           Lwt.fail (Unix.Unix_error(Uwt.to_unix_error error, "bind", ""))
-        end else Lwt.return { fd; closed = false }
+        end else Lwt.return { idx; fd; closed = false }
 
       let of_bound_fd fd =
         match Uwt.Udp.openudp fd with
-        | Uwt.Ok fd -> make fd
+        | Uwt.Ok fd ->
+          let description = match Uwt.Udp.getsockname fd with
+            | Uwt.Ok sockaddr ->
+               begin match ip_port_of_sockaddr sockaddr with
+               | Some (Some ip, port) -> "udp:" ^ (Ipaddr.to_string ip) ^ ":" ^ (string_of_int port)
+               | _ -> "unknown incoming UDP"
+               end
+            | Uwt.Error error -> "getpeername failed: " ^ (Uwt.strerror error) in
+          let idx = register_connection_no_limit description in
+          make ~idx fd
         | Uwt.Error error ->
           let msg = Printf.sprintf "Socket.Datagram.of_bound_fd failed with %s" (Uwt.strerror error) in
           Log.err (fun f -> f "%s" msg);
@@ -245,7 +257,7 @@ module Sockets = struct
           if not(Uwt.Int_result.is_ok result) then begin
             Log.err (fun f -> f "Socket.Datagram: close returned %s" (Uwt.strerror (Uwt.Int_result.to_error result)));
           end;
-          deallocate_connection ();
+          deregister_connection server.idx;
         end;
         Lwt.return_unit
 
