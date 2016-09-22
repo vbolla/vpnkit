@@ -58,11 +58,8 @@ module Make(Socket: Sig.SOCKETS) = struct
     Channel.flush t.c
     >>= fun () ->
     let rawfd = Socket.Stream.Unix.unsafe_get_raw_fd t.fd in
-    let description = (if stream then "tcp:" else "udp:") ^ (Ipaddr.V4.to_string ipv4) ^ (string_of_int port) in
-    Socket.register_connection description
-    >>= fun idx ->
     let result = String.make 8 '\000' in
-    let n, _, fd = try Fd_send_recv.recv_fd rawfd result 0 8 [] with e -> Socket.deregister_connection idx; raise e in
+    let n, _, fd = Fd_send_recv.recv_fd rawfd result 0 8 [] in
 
     ( if n <> 8 then Lwt.return (`Error (`Msg (Printf.sprintf "Message only contained %d bytes" n))) else begin
         let buf = Cstruct.create 8 in
@@ -85,7 +82,6 @@ module Make(Socket: Sig.SOCKETS) = struct
     >>= function
     | `Error x ->
       Unix.close fd;
-      Socket.deregister_connection idx;
       Lwt.return (`Error x)
     | `Ok x ->
       Lwt.return (`Ok x)
