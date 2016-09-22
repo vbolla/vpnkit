@@ -121,7 +121,7 @@ module Sockets = struct
          let userdesc = match userdesc with
            | None -> ""
            | Some x -> String.concat "" [ " ("; x; ")" ] in
-         let description = String.concat "" [ Ipaddr.to_string src; ":"; string_of_int src_port; "-"; Ipaddr.to_string dst; ":"; string_of_int dst_port; userdesc ] in
+         let description = "udp:" ^ (String.concat "" [ Ipaddr.to_string src; ":"; string_of_int src_port; "-"; Ipaddr.to_string dst; ":"; string_of_int dst_port; userdesc ]) in
          if Ipaddr.compare dst Ipaddr.(V4 V4.broadcast) = 0 then begin
            Log.debug (fun f -> f "Socket.Datagram.input %s: ignoring broadcast packet" description);
            Lwt.return None
@@ -466,14 +466,19 @@ module Sockets = struct
         server.listening_fds <- [];
         (* FIXME(djs55): errors *)
         List.iter (fun (idx, fd) ->
+        Log.debug (fun f -> f "XXX shutting down and closing listening Tcp fds");
           ignore (Uwt.Tcp.close fd);
           deregister_connection idx
         ) fds;
         Lwt.return ()
 
       let of_bound_fd ?(read_buffer_size = default_read_buffer_size) fd =
+        let description = match Unix.getsockname fd with
+          | Unix.ADDR_INET(iaddr, port) ->
+            "tcp:" ^ (Unix.string_of_inet_addr iaddr) ^ ":" ^ (string_of_int port)
+          | _ -> "of_bound_fd: unknown TCP socket" in
         let fd = Uwt.Tcp.opentcp_exn fd in
-        let idx = register_connection_no_limit "of_bound_fd" in
+        let idx = register_connection_no_limit description in
         make ~read_buffer_size [ (idx, fd) ]
 
       let listen server cb =
@@ -691,7 +696,7 @@ module Sockets = struct
                   (fun () ->
                     Lwt.catch
                       (fun () ->
-                        let description = getsockname server' in
+                        let description = "unix:" ^ (getsockname server') in
                         register_connection description
                         >>= fun idx ->
                         Lwt.return (Some (of_fd ~idx ~description client))
