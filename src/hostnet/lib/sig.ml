@@ -81,7 +81,8 @@ module type SOCKETS = sig
   (** TODO: hide these by refactoring Hyper-V sockets stuff *)
   val register_connection: string -> int Lwt.t
   val deregister_connection: int -> unit
-
+  val dump_connection_table: unit -> unit
+  
   module Datagram: sig
 
     type address = Ipaddr.t * int

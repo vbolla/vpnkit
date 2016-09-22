@@ -33,6 +33,13 @@ let next_connection_idx =
 exception Too_many_connections
 
 let connection_table = Hashtbl.create 511
+let dump_connection_table () =
+  Log.info (fun f -> f "There are %d open connections" (Hashtbl.length connection_table));
+  let i = ref 0 in
+  Hashtbl.iter (fun idx description ->
+    incr i;
+    Log.info (fun f -> f "%d: open connection %d: %s" (!i) idx description);
+  ) connection_table
 let register_connection_no_limit description =
   let idx = next_connection_idx () in
   Hashtbl.replace connection_table idx description;
