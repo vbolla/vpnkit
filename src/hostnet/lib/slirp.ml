@@ -56,44 +56,62 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Switch = Mux.Make(Netif)
   module Dhcp = Dhcp.Make(Switch)
 
-  module Arp_ethif = Ethif.Make(Switch)
-  module Arp = Arp.Make(Arp_ethif)
+  (* This ARP implementation will respond to the VM: *)
+  module Global_arp_ethif = Ethif.Make(Switch)
+  module Global_arp = Arp.Make(Global_arp_ethif)
+
+  (* This stack will attach to a switch port and represent a single remote IP *)
+  module Stack_ethif = Ethif.Make(Switch.Port)
+  module Stack_arpv4 = Arp.Make(Stack_ethif)
+  module Stack_ipv4 = Ipv4.Make(Stack_ethif)(Stack_arpv4)
+  module Stack_udp = Udp.Make(Stack_ipv4)
+  module Stack_tcp = Tcp.Flow.Make(Stack_ipv4)(Host.Time)(Clock)(Random)
 
   (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
 
-module Socket = Host.Sockets
+  type t = {
+    after_disconnect: unit Lwt.t;
+    interface: Netif.t;
+  }
 
-type stack = {
-  after_disconnect: unit Lwt.t;
-  interface: Netif.t;
-}
+  let after_disconnect t = t.after_disconnect
 
-let after_disconnect t = t.after_disconnect
+  let filesystem t =
+    Vfs.Dir.of_list
+      (fun () ->
+        Vfs.ok [
+          Vfs.Inode.dir "connections" Host.Sockets.connections;
+          Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
+        ]
+      )
 
-let filesystem t =
-  Vfs.Dir.of_list
-    (fun () ->
-      Vfs.ok [
-        Vfs.Inode.dir "connections" Host.Sockets.connections;
-        Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
-      ]
-    )
+  let is_dhcp =
+    let open Match in
+    ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
 
-let is_dhcp =
-  let open Match in
-  ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
+  let is_arp_request =
+    let open Match in
+    ethernet @@ arp ~opcode:`Request ()
 
-let is_arp_request =
-  let open Match in
-  ethernet @@ arp ~opcode:`Request ()
+  let is_dns =
+    let open Match in
+    ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
 
-let is_dns =
-  let open Match in
-  ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
+  let is_tcp_syn =
+    let open Match in
+    ethernet @@ ipv4 () @@ tcp ~syn:true () all
 
-let is_tcp_syn =
-  let open Match in
-  ethernet @@ ipv4 () @@ tcp ~syn:true () all
+  module Tcp = struct
+    type t = {
+      dst: Ipaddr.V4.t;
+      socket: Host.Sockets.Stream.Tcp.flow;
+      tcp: Stack_tcp.t;
+    }
+    module Map = Map.Make(Ipaddr.V4)
+    let all = ref Map.empty
+
+    let of_syn buf = failwith "unimplemented"
+  end
 
 let connect x peer_ip local_ip extra_dns_ip get_domain_search =
 
@@ -120,9 +138,9 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
     peer_ip, client_macaddr;
     local_ip, server_macaddr;
   ] @ (List.map (fun ip -> ip, server_macaddr) extra_dns_ip) in
-  or_failwith "arp_ethif" @@ Arp_ethif.connect switch
-  >>= fun arp_ethif ->
-  or_failwith "arp" @@ Arp.connect ~table:arp_table arp_ethif
+  or_failwith "arp_ethif" @@ Global_arp_ethif.connect switch
+  >>= fun global_arp_ethif ->
+  or_failwith "arp" @@ Global_arp.connect ~table:arp_table global_arp_ethif
   >>= fun arp ->
 
   let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
@@ -134,10 +152,18 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
       then Dhcp.callback dhcp buf
       else if Match.bufs is_arp_request [ buf ] then begin
         Log.debug (fun f -> f "ARP REQUEST");
-        Arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
+        (* Arp.input expects only the ARP packet, with no ethernet header prefix *)
+        Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
       end else if Match.bufs is_tcp_syn [ buf ] then begin
         Log.debug (fun f -> f "TCP SYN D3T3CT3D");
-        Lwt.return_unit
+        Tcp.of_syn buf
+        >>= function
+        | `Reset ->
+          Log.debug (fun f -> f "SENDING RESET");
+          Lwt.return_unit
+        | `Ok ->
+          Log.debug (fun f -> f "continuing handshake");
+          Lwt.return_unit
       end else begin
         Cstruct.hexdump buf;
         Lwt.return_unit

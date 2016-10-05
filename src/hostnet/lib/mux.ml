@@ -91,25 +91,30 @@ module Make(Netif: V1_LWT.NETWORK) = struct
 
   let mac t = Netif.mac t.netif
 
-  let port t rule =
-    let module M = struct
-      include DontCareAboutStats
-      include ObviouslyCommon
+  module Port = struct
+    include DontCareAboutStats
+    include ObviouslyCommon
 
-      type t = unit
-      let callback = ref (fun _ -> Lwt.return_unit)
+    type port = {
+      switch: t;
+      netif: Netif.t;
+      rule: rule;
+    }
 
-      let write () buffer = Netif.write t.netif buffer
-      let writev () buffers = Netif.writev t.netif buffers
-      let listen () callback =
-        t.rules <- RuleMap.add rule callback t.rules;
-        Lwt.return_unit
-      let disconnect () =
-        t.rules <- RuleMap.remove rule t.rules;
-        Lwt.return_unit
+    let write t buffer = Netif.write t.netif buffer
+    let writev t buffers = Netif.writev t.netif buffers
+    let listen t callback =
+      t.switch.rules <- RuleMap.add t.rule callback t.switch.rules;
+      Lwt.return_unit
+    let disconnect t =
+      t.switch.rules <- RuleMap.remove t.rule t.switch.rules;
+      Lwt.return_unit
 
-      let mac () = Netif.mac t.netif
-    end in
-    Lwt.return (module M: V1_LWT.NETWORK)
+    let mac t = Netif.mac t.netif
+
+    type t = port
+  end
+
+  let port t rule = { Port.switch = t; netif = t.netif; rule }
 
 end
