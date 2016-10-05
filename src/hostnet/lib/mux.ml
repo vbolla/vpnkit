@@ -79,10 +79,10 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     >>= fun () ->
     Lwt.return t
 
-  let write _t _buffer =
-    Lwt.fail (Failure "Mux.write should not be used directly")
-  let writev _t _buffers =
-    Lwt.fail (Failure "Mux.writev should not be used directly")
+  let write t buffer =
+    Netif.write t.netif buffer
+  let writev t buffers =
+    Netif.writev t.netif buffers
   let listen t callback =
     t.default_callback <- callback;
     Lwt.return_unit
