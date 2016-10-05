@@ -105,11 +105,26 @@ let udp ?src ?dst () f bufs =
   let dst'    = Cstructs.BE.get_uint16 payload 2 in
   proto = 17 && (optional src src') && (optional dst dst') && (f @@ Cstructs.shift payload 16)
 
-let tcp ?src ?dst () f bufs =
+let tcp ?src ?dst ?fin ?syn ?rst ?psh ?ack ?urg ?ece ?cwr () f bufs =
   let proto   = Cstructs.get_uint8    bufs    (1 + 1 + 2 + 2 + 2 + 1) in
   let payload = Cstructs.shift        bufs    (1 + 1 + 2 + 2 + 2 + 1 + 1 + 2 + 4 + 4) in
   let src'    = Cstructs.BE.get_uint16 payload 0 in
   let dst'    = Cstructs.BE.get_uint16 payload 2 in
-  proto = 6 && (optional src src') && (optional dst dst') && (f @@ Cstructs.shift payload 16)
+  let flags   = Cstructs.get_uint8    payload    (2 + 2 + 4 + 4 + 1) in
+  let fin'    = (flags land (1 lsl 0)) > 0 in
+  let syn'    = (flags land (1 lsl 1)) > 0 in
+  let rst'    = (flags land (1 lsl 2)) > 0 in
+  let psh'    = (flags land (1 lsl 3)) > 0 in
+  let ack'    = (flags land (1 lsl 4)) > 0 in
+  let urg'    = (flags land (1 lsl 5)) > 0 in
+  let ece'    = (flags land (1 lsl 6)) > 0 in
+  let cwr'    = (flags land (1 lsl 7)) > 0 in
+  proto = 6
+  && (optional src src') && (optional dst dst')
+  && (optional fin fin') && (optional syn syn')
+  && (optional rst rst') && (optional psh psh')
+  && (optional ack ack') && (optional urg urg')
+  && (optional ece ece') && (optional cwr cwr')
+  && (f @@ Cstructs.shift payload 16)
 
 let bufs t bufs = t bufs

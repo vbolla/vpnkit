@@ -25,6 +25,14 @@ val ipv4:
 val tcp:
    ?src:int
 -> ?dst:int
+-> ?fin:bool
+-> ?syn:bool
+-> ?rst:bool
+-> ?psh:bool
+-> ?ack:bool
+-> ?urg:bool
+-> ?ece:bool
+-> ?cwr:bool
 -> unit -> t -> t
 (** Matches all TCP frames *)
 
