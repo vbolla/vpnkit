@@ -56,6 +56,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Switch = Mux.Make(Netif)
   module Dhcp = Dhcp.Make(Switch)
 
+  module Arp_ethif = Ethif.Make(Switch)
+  module Arp = Arp.Make(Arp_ethif)
+
   (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
 
 module Socket = Host.Sockets
@@ -80,9 +83,17 @@ let is_dhcp =
   let open Match in
   ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
 
+let is_arp_request =
+  let open Match in
+  ethernet @@ arp ~opcode:`Request ()
+
 let is_dns =
   let open Match in
   ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
+
+let is_tcp_syn =
+  let open Match in
+  ethernet @@ ipv4 () @@ tcp ~syn:true () all
 
 let connect x peer_ip local_ip extra_dns_ip get_domain_search =
 
@@ -104,6 +115,16 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
   Switch.connect interface
   >>= fun switch ->
 
+  (* Serve a static ARP table *)
+  let arp_table = [
+    peer_ip, client_macaddr;
+    local_ip, server_macaddr;
+  ] @ (List.map (fun ip -> ip, server_macaddr) extra_dns_ip) in
+  or_failwith "arp_ethif" @@ Arp_ethif.connect switch
+  >>= fun arp_ethif ->
+  or_failwith "arp" @@ Arp.connect ~table:arp_table arp_ethif
+  >>= fun arp ->
+
   let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
 
   (* Add a listener which looks for new flows *)
@@ -111,7 +132,13 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
     (fun buf ->
       if Match.bufs is_dhcp [ buf ]
       then Dhcp.callback dhcp buf
-      else begin
+      else if Match.bufs is_arp_request [ buf ] then begin
+        Log.debug (fun f -> f "ARP REQUEST");
+        Arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
+      end else if Match.bufs is_tcp_syn [ buf ] then begin
+        Log.debug (fun f -> f "TCP SYN D3T3CT3D");
+        Lwt.return_unit
+      end else begin
         Cstruct.hexdump buf;
         Lwt.return_unit
       end
