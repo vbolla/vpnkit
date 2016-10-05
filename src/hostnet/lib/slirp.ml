@@ -11,10 +11,7 @@ let client_macaddr = Macaddr.of_string_exn "C0:FF:EE:C0:FF:EE"
 (* random MAC from https://www.hellion.org.uk/cgi-bin/randmac.pl *)
 let server_macaddr = Macaddr.of_string_exn "F6:16:36:BC:F9:C6"
 
-let mtu = 1452 (* packets above this size with DNF set will get ICMP errors *)
-
-let finally f g =
-  Lwt.catch (fun () -> f () >>= fun r -> g () >>= fun () -> return r) (fun e -> g () >>= fun () -> fail e)
+let _mtu = 1452 (* packets above this size with DNF set will get ICMP errors *)
 
 let log_exception_continue description f =
   Lwt.catch
@@ -23,6 +20,11 @@ let log_exception_continue description f =
        Log.err (fun f -> f "%s: caught %s" description (Printexc.to_string e));
        Lwt.return ()
     )
+
+let or_failwith name m =
+  m >>= function
+  | `Error _ -> Lwt.fail (Failure (Printf.sprintf "Failed to connect %s device" name))
+  | `Ok x -> Lwt.return x
 
 let restart_on_change name to_string values =
   Active_config.tl values
@@ -47,14 +49,18 @@ type config = {
 }
 
 module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_CONF)(Host: Sig.HOST) = struct
-  module Tcpip_stack = Tcpip_stack.Make(Vmnet)(Host.Time)
-  module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time)
+  (* module Tcpip_stack = Tcpip_stack.Make(Vmnet)(Host.Time) *)
+
+  module Filteredif = Filter.Make(Vmnet)
+  module Netif = Capture.Make(Filteredif)
+
+  (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
 
 module Socket = Host.Sockets
 
 type stack = {
   after_disconnect: unit Lwt.t;
-  capture: Tcpip_stack.Netif.t;
+  interface: Netif.t;
 }
 
 let after_disconnect t = t.after_disconnect
@@ -64,24 +70,35 @@ let filesystem t =
     (fun () ->
       Vfs.ok [
         Vfs.Inode.dir "connections" Host.Sockets.connections;
-        Vfs.Inode.dir "capture" @@ Tcpip_stack.Netif.filesystem t.capture;
+        Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
       ]
     )
 
-let connect x peer_ip local_ip extra_dns_ip get_domain_search =
+let connect x _peer_ip _local_ip _extra_dns_ip _get_domain_search =
+
+  let valid_subnets = [ Ipaddr.V4.Prefix.global ] in
+  let valid_sources = [ Ipaddr.V4.of_string_exn "0.0.0.0" ] in
+
+  or_failwith "filter" @@ Filteredif.connect ~valid_subnets ~valid_sources x
+  >>= fun (filteredif: Filteredif.t) ->
+  or_failwith "capture" @@ Netif.connect filteredif
+  >>= fun interface ->
+
+  let kib = 1024 in
+  let mib = 1024 * kib in
+  (* Capture 1 MiB of all traffic *)
+  Netif.add_match ~t:interface ~name:"all.pcap" ~limit:mib
+    Capture.Match.all;
+  (* Capture 256 KiB of DNS traffic *)
+  Netif.add_match ~t:interface ~name:"dns.pcap" ~limit:(256 * kib)
+    Capture.Match.(ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all))));
+
+(*
   let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search in
         begin Tcpip_stack.connect ~config x
         >>= function
         | `Error (`Msg m) -> failwith m
         | `Ok (s, udps, capture) ->
-            let kib = 1024 in
-            let mib = 1024 * kib in
-            (* Capture 1 MiB of all traffic *)
-            Tcpip_stack.Netif.add_match ~t:capture ~name:"all.pcap" ~limit:mib
-              Capture.Match.all;
-            (* Capture 256 KiB of DNS traffic *)
-            Tcpip_stack.Netif.add_match ~t:capture ~name:"dns.pcap" ~limit:(256 * kib)
-              Capture.Match.(ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all))));
             let ips_to_udp = List.combine extra_dns_ip udps in
             Vmnet.add_listener x (
               fun buf ->
@@ -235,12 +252,12 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
             );
             Tcpip_stack.listen s
             >>= fun () ->
+            *)
             Log.info (fun f -> f "TCP/IP ready");
             Lwt.return {
               after_disconnect = Vmnet.after_disconnect x;
-              capture
+              interface
             }
-        end
 
   let create config =
     let driver = [ "com.docker.driver.amd64-linux" ] in
