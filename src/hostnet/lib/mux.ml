@@ -68,8 +68,8 @@ module Make(Netif: V1_LWT.NETWORK) = struct
         t.default_callback buf
       end
     | _ ->
-      Log.debug (fun f -> f "dropping non-IPv4 frame");
-      Lwt.return_unit
+      Log.debug (fun f -> f "using default callback for non-IPv4 frame");
+      t.default_callback buf
 
   let connect netif =
     let rules = RuleMap.empty in
