@@ -53,6 +53,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Filteredif = Filter.Make(Vmnet)
   module Netif = Capture.Make(Filteredif)
+  module Switch = Mux.Make(Netif)
+  module Dhcp = Dhcp.Make(Switch)
 
   (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
 
@@ -74,7 +76,15 @@ let filesystem t =
       ]
     )
 
-let connect x _peer_ip _local_ip _extra_dns_ip _get_domain_search =
+let is_dhcp =
+  let open Capture.Match in
+  ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
+
+let is_dns =
+  let open Capture.Match in
+  ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
+
+let connect x peer_ip local_ip extra_dns_ip get_domain_search =
 
   let valid_subnets = [ Ipaddr.V4.Prefix.global ] in
   let valid_sources = [ Ipaddr.V4.of_string_exn "0.0.0.0" ] in
@@ -87,12 +97,26 @@ let connect x _peer_ip _local_ip _extra_dns_ip _get_domain_search =
   let kib = 1024 in
   let mib = 1024 * kib in
   (* Capture 1 MiB of all traffic *)
-  Netif.add_match ~t:interface ~name:"all.pcap" ~limit:mib
-    Capture.Match.all;
+  Netif.add_match ~t:interface ~name:"all.pcap" ~limit:mib Capture.Match.all;
   (* Capture 256 KiB of DNS traffic *)
-  Netif.add_match ~t:interface ~name:"dns.pcap" ~limit:(256 * kib)
-    Capture.Match.(ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all))));
+  Netif.add_match ~t:interface ~name:"dns.pcap" ~limit:(256 * kib) is_dns;
 
+  Switch.connect interface
+  >>= fun switch ->
+
+  let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
+
+  (* Add a listener which looks for new flows *)
+  Switch.listen switch
+    (fun buf ->
+      if is_dhcp [ buf ]
+      then Dhcp.callback dhcp buf
+      else begin
+        Cstruct.hexdump buf;
+        Lwt.return_unit
+      end
+    )
+  >>= fun () ->
 (*
   let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search in
         begin Tcpip_stack.connect ~config x

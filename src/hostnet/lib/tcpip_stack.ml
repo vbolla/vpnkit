@@ -95,78 +95,7 @@ module Tcp1 = Tcp.Flow.Make(Ipv41)(Time)(Clock)(Random)
 include Tcpip_stack_direct.Make(Console_unix)(Time)
     (Random)(Netif)(Ethif1)(Arpv41)(Ipv41)(Udp1)(Tcp1)
 
-module Dhcp = struct
-  let of_interest mac dest =
-    Macaddr.compare dest mac = 0 || not (Macaddr.is_unicast dest)
-
-  (* With a short lease time we try to avoid spamming the logs with DHCP
-     messages. *)
-  let logged_bootrequest = ref false
-  let logged_bootreply = ref false
-
-  let input net (config : Dhcp_server.Config.t) database buf =
-    let open Dhcp_server in
-    match (Dhcp_wire.pkt_of_buf buf (Cstruct.len buf)) with
-    | `Error e ->
-      Log.err (fun f -> f "failed to parse DHCP packet: %s" e);
-      Lwt.return database
-    | `Ok pkt ->
-      match (Input.input_pkt config database pkt (Clock.time ())) with
-      | Input.Silence -> Lwt.return database
-      | Input.Update database ->
-        Log.debug (fun f -> f "lease database updated");
-        Lwt.return database
-      | Input.Warning w ->
-        Log.warn (fun f -> f "%s" w);
-        Lwt.return database
-      | Input.Error e ->
-        Log.err (fun f -> f "%s" e);
-        Lwt.return database
-      | Input.Reply (reply, database) ->
-        let open Dhcp_wire in
-        if pkt.op <> Dhcp_wire.BOOTREQUEST || not !logged_bootrequest
-        then Log.info (fun f -> f "%s from %s" (op_to_string pkt.op) (Macaddr.to_string (pkt.srcmac)));
-        logged_bootrequest := !logged_bootrequest || (pkt.op = Dhcp_wire.BOOTREQUEST);
-        Netif.write net (Dhcp_wire.buf_of_pkt reply)
-        >>= fun () ->
-        let domain = List.fold_left (fun acc x -> match x with
-          | Domain_name y -> y
-          | _ -> acc) "unknown" reply.options in
-        let dns = List.fold_left (fun acc x -> match x with
-          | Dns_servers ys -> String.concat ", " (List.map Ipaddr.V4.to_string ys)
-          | _ -> acc) "none" reply.options in
-        let routers = List.fold_left (fun acc x -> match x with
-          | Routers ys -> String.concat ", " (List.map Ipaddr.V4.to_string ys)
-          | _ -> acc) "none" reply.options in
-        if reply.op <> Dhcp_wire.BOOTREPLY || not !logged_bootreply
-        then Log.info (fun f -> f "%s to %s yiddr %s siddr %s dns %s router %s domain %s"
-          (op_to_string reply.op) (Macaddr.to_string (reply.dstmac))
-          (Ipaddr.V4.to_string reply.yiaddr) (Ipaddr.V4.to_string reply.siaddr)
-          dns routers domain
-        );
-        logged_bootreply := !logged_bootreply || (reply.op = Dhcp_wire.BOOTREPLY);
-        Lwt.return database
-
-  let listen mac config net buf =
-    (* TODO: the scope of this reference ensures that the database won't
-       actually remain updated after any particular transaction.  In our case
-       that's OK, because we only really want to serve one pre-allocated IP
-       anyway, but this will present a problem if that assumption ever changes.  *)
-    let database = ref (Dhcp_server.Lease.make_db ()) in
-    match (Wire_structs.parse_ethernet_frame buf) with
-    | Some (proto, dst, _payload) when of_interest mac dst ->
-      (match proto with
-       | Some Wire_structs.IPv4 ->
-         if Dhcp_wire.is_dhcp buf (Cstruct.len buf) then begin
-           input net (config.get_dhcp_configuration ()) !database buf >>= fun db ->
-           database := db;
-           Lwt.return_unit
-         end
-         else
-           Lwt.return_unit
-       | _ -> Lwt.return_unit)
-    | _ -> Lwt.return_unit
-end
+module Dhcp = Dhcp.Make(Netif)
 
 module Infix = struct
   let ( >>= ) m f = m >>= function
@@ -224,8 +153,6 @@ let connect ~config (ppp: Vmnet.t) =
     ) (`Ok []) config.extra_dns_ip
   >>= fun udps ->
 
-  (* Hook in the DHCP server too *)
-  Netif.add_listener interface (Dhcp.listen config.server_macaddr config interface);
   Lwt.return (`Ok (stack, List.rev udps, interface))
 
 (* FIXME: this is unnecessary, mirage-flow should be changed *)
