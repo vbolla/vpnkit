@@ -77,11 +77,11 @@ let filesystem t =
     )
 
 let is_dhcp =
-  let open Capture.Match in
+  let open Match in
   ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
 
 let is_dns =
-  let open Capture.Match in
+  let open Match in
   ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
 
 let connect x peer_ip local_ip extra_dns_ip get_domain_search =
@@ -97,7 +97,7 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
   let kib = 1024 in
   let mib = 1024 * kib in
   (* Capture 1 MiB of all traffic *)
-  Netif.add_match ~t:interface ~name:"all.pcap" ~limit:mib Capture.Match.all;
+  Netif.add_match ~t:interface ~name:"all.pcap" ~limit:mib Match.all;
   (* Capture 256 KiB of DNS traffic *)
   Netif.add_match ~t:interface ~name:"dns.pcap" ~limit:(256 * kib) is_dns;
 
@@ -109,7 +109,7 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
   (* Add a listener which looks for new flows *)
   Switch.listen switch
     (fun buf ->
-      if is_dhcp [ buf ]
+      if Match.bufs is_dhcp [ buf ]
       then Dhcp.callback dhcp buf
       else begin
         Cstruct.hexdump buf;
