@@ -11,6 +11,11 @@ val ethernet: t -> t
 val (or): t -> t -> t
 (** [a or b] matches [a] or [b] *)
 
+val arp:
+   ?opcode:[> `Request | `Reply | `Unknown ]
+   -> unit -> t
+(** Matches ARP packets *)
+
 val ipv4:
    ?src:Ipaddr.V4.t
    -> ?dst:Ipaddr.V4.t

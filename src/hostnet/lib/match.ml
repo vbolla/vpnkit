@@ -84,6 +84,13 @@ let optional opt x = match opt with
   | None -> true
   | Some x' -> x' = x
 
+let arp ?opcode () bufs =
+  let ethertype = Cstructs.BE.get_uint16 bufs 12 in
+  let payload = Cstructs.shift bufs 14 in
+  let op = Cstructs.BE.get_uint16 payload 6 in
+  let opcode' = match op with 1 -> `Request | 2 -> `Reply | _ -> `Unknown in
+  ethertype = 0x0806 && (optional opcode opcode')
+
 let ipv4 ?src ?dst () f bufs =
   let ethertype = Cstructs.BE.get_uint16 bufs 12 in
   let payload = Cstructs.shift bufs 14 in
