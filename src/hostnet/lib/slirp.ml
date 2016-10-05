@@ -21,10 +21,21 @@ let log_exception_continue description f =
        Lwt.return ()
     )
 
+module Infix = struct
+  let ( >>= ) m f = m >>= function
+    | `Ok x -> f x
+    | `Error x -> Lwt.return (`Error x)
+end
+
 let or_failwith name m =
   m >>= function
   | `Error _ -> Lwt.fail (Failure (Printf.sprintf "Failed to connect %s device" name))
   | `Ok x -> Lwt.return x
+
+let or_error name m =
+  m >>= function
+  | `Error _ -> Lwt.return (`Error (`Msg (Printf.sprintf "Failed to connect %s device" name)))
+  | `Ok x -> Lwt.return (`Ok x)
 
 let restart_on_change name to_string values =
   Active_config.tl values
@@ -103,14 +114,46 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Tcp = struct
     type t = {
-      dst: Ipaddr.V4.t;
+      ip: Ipaddr.V4.t;
       socket: Host.Sockets.Stream.Tcp.flow;
-      tcp: Stack_tcp.t;
+      tcp4: Stack_tcp.t;
     }
     module Map = Map.Make(Ipaddr.V4)
     let all = ref Map.empty
 
-    let of_syn buf = failwith "unimplemented"
+    let process_syn switch arp_table buf =
+      let ip = failwith "ip" in
+      let port = failwith "port" in
+
+      if Map.mem ip !all
+      then Lwt.return (`Ok (Map.find ip !all))
+      else begin
+        let netif = Switch.port switch ip in
+        let open Infix in
+        or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+        >>= fun ethif ->
+        or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+        >>= fun arp ->
+        or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+        >>= fun ipv4 ->
+        or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+        >>= fun _udp4 ->
+        or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+        >>= fun tcp4 ->
+
+        let open Lwt.Infix in
+        Stack_ipv4.set_ip ipv4 ip
+        >>= fun () ->
+        Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.broadcast (* 255.255.255.255.*)
+        >>= fun () ->
+        Stack_ipv4.set_ip_gateways ipv4 [ Ipaddr.V4.unspecified ] (* 0.0.0.0 *)
+        >>= fun () ->
+
+        let open Infix in
+        Host.Sockets.Stream.Tcp.connect (ip, port)
+        >>= fun socket ->
+        Lwt.return (`Ok { ip; socket; tcp4 })
+      end
   end
 
 let connect x peer_ip local_ip extra_dns_ip get_domain_search =
@@ -156,12 +199,12 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
         Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
       end else if Match.bufs is_tcp_syn [ buf ] then begin
         Log.debug (fun f -> f "TCP SYN D3T3CT3D");
-        Tcp.of_syn buf
+        Tcp.process_syn switch arp_table buf
         >>= function
-        | `Reset ->
-          Log.debug (fun f -> f "SENDING RESET");
+        | `Error (`Msg m) ->
+          Log.debug (fun f -> f "%s: SENDING RESET" m);
           Lwt.return_unit
-        | `Ok ->
+        | `Ok _tcp ->
           Log.debug (fun f -> f "continuing handshake");
           Lwt.return_unit
       end else begin
