@@ -53,6 +53,7 @@ module Make(Netif: V1_LWT.NETWORK) = struct
   type t = {
     netif: Netif.t;
     mutable rules: callback RuleMap.t;
+    mutable default_callback: callback;
   }
 
   let callback t buf =
@@ -63,8 +64,8 @@ module Make(Netif: V1_LWT.NETWORK) = struct
       if RuleMap.mem dst t.rules
       then RuleMap.find dst t.rules buf
       else begin
-        Log.debug (fun f -> f "dropping packet for %s" (Ipaddr.V4.to_string dst));
-        Lwt.return_unit
+        Log.debug (fun f -> f "using default callback for packet for %s" (Ipaddr.V4.to_string dst));
+        t.default_callback buf
       end
     | _ ->
       Log.debug (fun f -> f "dropping non-IPv4 frame");
@@ -72,7 +73,8 @@ module Make(Netif: V1_LWT.NETWORK) = struct
 
   let connect netif =
     let rules = RuleMap.empty in
-    let t = { netif; rules } in
+    let default_callback = fun _ -> Lwt.return_unit in
+    let t = { netif; rules; default_callback } in
     Netif.listen netif (callback t)
     >>= fun () ->
     Lwt.return t
@@ -81,9 +83,11 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     Lwt.fail (Failure "Mux.write should not be used directly")
   let writev _t _buffers =
     Lwt.fail (Failure "Mux.writev should not be used directly")
-  let listen _t _callback =
-    Lwt.fail (Failure "Mux.listen should not be used directly")
-  let disconnect t = Lwt.return_unit
+  let listen t callback =
+    t.default_callback <- callback;
+    Lwt.return_unit
+  let disconnect t =
+    Netif.disconnect t.netif
 
   let mac t = Netif.mac t.netif
 
