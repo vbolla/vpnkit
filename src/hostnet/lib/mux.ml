@@ -1,5 +1,12 @@
 open Lwt.Infix
 
+let src =
+  let src = Logs.Src.create "mux" ~doc:"Mirage TCP/IP <-> socket proxy" in
+  Logs.Src.set_level src (Some Logs.Debug);
+  src
+
+module Log = (val Logs.src_log src : Logs.LOG)
+
 module DontCareAboutStats = struct
   type stats = {
     mutable rx_bytes: int64;
@@ -39,16 +46,33 @@ module Make(Netif: V1_LWT.NETWORK) = struct
 
   type rule = Ipaddr.V4.t
 
+  module RuleMap = Map.Make(Ipaddr.V4)
+
+  type callback = Cstruct.t -> unit Lwt.t
+
   type t = {
     netif: Netif.t;
+    mutable rules: callback RuleMap.t;
   }
 
   let callback t buf =
     (* Does the packet match any of our rules? *)
-    Lwt.return_unit
+    match Wire_structs.parse_ethernet_frame buf with
+    | Some (Some Wire_structs.IPv4, _, payload) ->
+      let dst = Wire_structs.Ipv4_wire.get_ipv4_dst payload |> Ipaddr.V4.of_int32 in
+      if RuleMap.mem dst t.rules
+      then RuleMap.find dst t.rules buf
+      else begin
+        Log.debug (fun f -> f "dropping packet for %s" (Ipaddr.V4.to_string dst));
+        Lwt.return_unit
+      end
+    | _ ->
+      Log.debug (fun f -> f "dropping non-IPv4 frame");
+      Lwt.return_unit
 
   let connect netif =
-    let t = { netif } in
+    let rules = RuleMap.empty in
+    let t = { netif; rules } in
     Netif.listen netif (callback t)
     >>= fun () ->
     Lwt.return t
@@ -68,13 +92,19 @@ module Make(Netif: V1_LWT.NETWORK) = struct
       include DontCareAboutStats
       include ObviouslyCommon
 
-      type t = Netif.t
-      let write t buffer = Netif.write t buffer
-      let writev t buffers = Netif.writev t buffers
-      let listen t callback = Netif.listen t callback
-      let disconnect t = Lwt.return_unit
+      type t = unit
+      let callback = ref (fun _ -> Lwt.return_unit)
 
-      let mac t = failwith "unimplemented port.mac"
+      let write () buffer = Netif.write t.netif buffer
+      let writev () buffers = Netif.writev t.netif buffers
+      let listen () callback =
+        t.rules <- RuleMap.add rule callback t.rules;
+        Lwt.return_unit
+      let disconnect () =
+        t.rules <- RuleMap.remove rule t.rules;
+        Lwt.return_unit
+
+      let mac () = Netif.mac t.netif
     end in
     Lwt.return (module M: V1_LWT.NETWORK)
 
