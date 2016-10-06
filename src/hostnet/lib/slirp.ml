@@ -123,17 +123,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Tcp = struct
     type t = {
-      src: Ipaddr.V4.t;
-      dst: Ipaddr.V4.t;
-      src_port: int;
-      dst_port: int;
+      id: Stack_tcp_wire.id;
       mutable socket: Host.Sockets.Stream.Tcp.flow option;
     }
 
-    let to_string t =
+    let string_of_id id =
       Printf.sprintf "TCP %s:%d > %s:%d"
-        (Ipaddr.V4.to_string t.src) t.src_port
-        (Ipaddr.V4.to_string t.dst) t.dst_port
+        (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) id.Stack_tcp_wire.dest_port
+        (Ipaddr.V4.to_string id.Stack_tcp_wire.local_ip) id.Stack_tcp_wire.local_port
+
+    let to_string t =
+      Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
 
     module Map = Map.Make(Ipaddr.V4)
     let all = ref Map.empty
@@ -159,50 +159,55 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             Lwt.return_unit
           )
 
-    let xmit_rst ip buf =
-      let ipv4      = Cstruct.shift         buf    14                         in
-      let src       = Cstruct.BE.get_uint32 ipv4   12 |> Ipaddr.V4.of_int32   in
-      let dst       = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
-      let vihl      = Cstruct.get_uint8     ipv4   0                          in
-      let tcp       = Cstruct.shift         ipv4   (4 * (vihl land 0xf))      in
-      let src_port  = Cstruct.BE.get_uint16 tcp    0                          in
-      let dst_port  = Cstruct.BE.get_uint16 tcp    2                          in
-      let flags     = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
-      let sequence  = Cstruct.BE.get_uint32 tcp    4                          in
-      let seq       = Cstruct.BE.get_uint32 tcp    8 |> Tcp.Sequence.of_int32 in
+    type packet = {
+      id: Stack_tcp_wire.id;
+      sequence: int32;
+      ack_number: Tcp.Sequence.t;
+      syn: bool;
+      fin: bool;
+      payload: Cstruct.t;
+    }
+
+    let string_of_packet p =
+      Printf.sprintf "%s sequence=%ld ack_number=%ld syn=%b fin=%b len(payload)=%d"
+        (string_of_id p.id) p.sequence (Tcp.Sequence.to_int32 p.ack_number)
+        p.syn p.fin (Cstruct.len p.payload)
+
+    let parse buf =
+      let ipv4       = Cstruct.shift         buf    14                         in
+      let src        = Cstruct.BE.get_uint32 ipv4   12 |> Ipaddr.V4.of_int32   in
+      let dst        = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
+      let vihl       = Cstruct.get_uint8     ipv4   0                          in
+      let tcp        = Cstruct.shift         ipv4   (4 * (vihl land 0xf))      in
+      let src_port   = Cstruct.BE.get_uint16 tcp    0                          in
+      let dst_port   = Cstruct.BE.get_uint16 tcp    2                          in
+      let flags      = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
+      let sequence   = Cstruct.BE.get_uint32 tcp    4                          in
+      let ack_number = Cstruct.BE.get_uint32 tcp    8 |> Tcp.Sequence.of_int32 in
+      let payload    = Cstruct.shift         tcp    16                         in
 
       let fin       = (flags land (1 lsl 0)) > 0 in
       let syn       = (flags land (1 lsl 1)) > 0 in
-      let rx_ack    = Some (Tcp.Sequence.of_int32 Int32.(add sequence (add (if fin then 1l else 0l) (if syn then 1l else 0l)))) in
       let id =
         { Stack_tcp_wire.local_port = dst_port;
           dest_ip         = src;
           local_ip        = dst;
           dest_port       = src_port } in
-      Log.debug (fun f -> f "xmit_rst src=%s dst=%s vihl=%d src_port=%d dst_port=%d"
-        (Ipaddr.V4.to_string src) (Ipaddr.V4.to_string dst)
-        vihl src_port dst_port
-      );
-      Stack_tcp_wire.xmit ~ip ~id ~rst:true ~rx_ack ~seq ~window:0 ~options:[] []
+      { id; sequence; ack_number; syn; fin; payload }
+
+    let xmit_rst ip packet =
+      let rx_ack = Some (Tcp.Sequence.of_int32 Int32.(add packet.sequence (add (if packet.fin then 1l else 0l) (if packet.syn then 1l else 0l)))) in
+      Log.debug (fun f -> f "xmit_rst %s" (string_of_packet packet));
+      Stack_tcp_wire.xmit ~ip ~id:packet.id ~rst:true ~rx_ack ~seq:packet.ack_number ~window:0 ~options:[] []
 
     let process_syn switch arp_table buf =
-      let ipv4      = Cstruct.shift         buf     14                       in
-      let src       = Cstruct.BE.get_uint32 ipv4    12 |> Ipaddr.V4.of_int32 in
-      let dst       = Cstruct.BE.get_uint32 ipv4    16 |> Ipaddr.V4.of_int32 in
-      let vihl      = Cstruct.get_uint8     ipv4    0                        in
-      let tcp       = Cstruct.shift         ipv4    (4 * (vihl land 0xf))    in
-      let src_port  = Cstruct.BE.get_uint16 tcp     0                        in
-      let dst_port  = Cstruct.BE.get_uint16 tcp     2                        in
-      let payload   = Cstruct.shift         tcp     16                       in
-      Log.debug (fun f -> f "process_syn src=%s dst=%s vihl=%d src_port=%d dst_port=%d len(payload)=%d"
-        (Ipaddr.V4.to_string src) (Ipaddr.V4.to_string dst)
-        vihl src_port dst_port (Cstruct.len payload)
-      );
+      let packet = parse buf in
+      Log.debug (fun f -> f "process_syn %s" (string_of_packet packet));
 
-      if Map.mem dst !all
-      then Lwt.return (`Ok (Map.find dst !all))
+      if Map.mem packet.id.Stack_tcp_wire.local_ip !all
+      then Lwt.return (`Ok (Map.find packet.id.Stack_tcp_wire.local_ip !all))
       else begin
-        let netif = Switch.port switch dst in
+        let netif = Switch.port switch packet.id.Stack_tcp_wire.local_ip in
         let open Infix in
         or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
         >>= fun ethif ->
@@ -216,7 +221,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         >>= fun tcp4 ->
 
         let open Lwt.Infix in
-        Stack_ipv4.set_ip ipv4 dst (* I am the destination *)
+        Stack_ipv4.set_ip ipv4 packet.id.Stack_tcp_wire.local_ip (* I am the destination *)
         >>= fun () ->
         Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.broadcast (* 255.255.255.255.*)
         >>= fun () ->
@@ -224,20 +229,20 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         >>= fun () ->
 
         (* If this fails we won't register rule or [tcp] *)
-        Host.Sockets.Stream.Tcp.connect (dst, dst_port)
+        Host.Sockets.Stream.Tcp.connect (packet.id.Stack_tcp_wire.local_ip, packet.id.Stack_tcp_wire.local_port)
         >>= function
         | `Error (`Msg m) ->
-          Log.err (fun f -> f "Failed to connect to %s:%d, sending RST" (Ipaddr.V4.to_string dst) dst_port);
-          xmit_rst ipv4 buf
+          Log.err (fun f -> f "Failed to connect to %s:%d, sending RST" (Ipaddr.V4.to_string packet.id.Stack_tcp_wire.local_ip) packet.id.Stack_tcp_wire.local_port);
+          xmit_rst ipv4 packet
           >>= fun () ->
           Lwt.return (`Error (`Msg m))
         | `Ok socket ->
-          let t = { src; dst; src_port; dst_port; socket = Some socket } in
+          let t = { id = packet.id; socket = Some socket } in
           (* FIXME: this needs to handle more than one connection to the same IP *)
           let listeners port =
             Log.debug (fun f -> f "finding listener for port %d" port);
             Some (fun flow -> callback t flow) in
-          Stack_tcp.input tcp4 ~listeners ~src ~dst payload
+          Stack_tcp.input tcp4 ~listeners ~src:packet.id.Stack_tcp_wire.dest_ip ~dst:packet.id.Stack_tcp_wire.local_ip packet.payload
           >>= fun () ->
           Lwt.return (`Ok t)
       end
