@@ -132,21 +132,26 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Tcp = struct
 
     module Id = struct
-      type t = Stack_tcp_wire.id
-      let compare
-        { Stack_tcp_wire.local_ip = local_ip1; local_port = local_port1; dest_ip = dest_ip1; dest_port = dest_port1 }
-        { Stack_tcp_wire.local_ip = local_ip2; local_port = local_port2; dest_ip = dest_ip2; dest_port = dest_port2 } =
-        let dest_ip' = Ipaddr.V4.compare dest_ip1 dest_ip2 in
-        let local_ip' = Ipaddr.V4.compare local_ip1 local_ip2 in
-        let dest_port' = compare dest_port1 dest_port2 in
-        let local_port' = compare local_port1 local_port2 in
-        if dest_port' <> 0
-        then dest_port'
-        else if dest_ip' <> 0
-        then dest_ip'
-        else if local_ip' <> 0
-        then local_ip'
-        else local_port'
+      module M = struct
+        type t = Stack_tcp_wire.id
+        let compare
+          { Stack_tcp_wire.local_ip = local_ip1; local_port = local_port1; dest_ip = dest_ip1; dest_port = dest_port1 }
+          { Stack_tcp_wire.local_ip = local_ip2; local_port = local_port2; dest_ip = dest_ip2; dest_port = dest_port2 } =
+          let dest_ip' = Ipaddr.V4.compare dest_ip1 dest_ip2 in
+          let local_ip' = Ipaddr.V4.compare local_ip1 local_ip2 in
+          let dest_port' = compare dest_port1 dest_port2 in
+          let local_port' = compare local_port1 local_port2 in
+          if dest_port' <> 0
+          then dest_port'
+          else if dest_ip' <> 0
+          then dest_ip'
+          else if local_ip' <> 0
+          then local_ip'
+          else local_port'
+      end
+      include M
+      module Set = Set.Make(M)
+      module Map = Map.Make(M)
     end
 
     module Flow = struct
@@ -160,7 +165,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       let to_string t =
         Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
 
-      module Set = Set.Make(Id)
     end
 
     module Stack = struct
@@ -170,7 +174,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         arp:             Stack_arpv4.t;
         ipv4:            Stack_ipv4.t;
         tcp4:            Stack_tcp.t;
-        mutable flows:   Flow.Set.t;
+        mutable pending: Id.Set.t;
+        mutable flows:   Flow.t Id.Map.t;
       }
 
       let all : t IPMap.t ref = ref IPMap.empty
@@ -198,7 +203,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
       (* Pre-parse incoming TCP packets and for every SYN, attempt to make the
          on-going connection before handing the packet to the stack. *)
-      let tcp_input tcp4 ~src ~dst tcp =
+      let tcp_input t ~src ~dst tcp =
         let reject_flow port =
           Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
           None in
@@ -211,33 +216,44 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             dest_ip         = src;
             local_ip        = dst;
             dest_port       = src_port } in
-        ( if syn then begin
-            (* FIXME: we need to ignore SYNs for this port while we're blocked connecting *)
-            Host.Sockets.Stream.Tcp.connect (dst, dst_port)
-            >>= function
-            | `Error (`Msg m) ->
-              Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string dst) dst_port m);
-              Lwt.return reject_flow
-            | `Ok socket ->
-              let t = { Flow.id; socket = Some socket } in
-              let listeners port =
-                Log.debug (fun f -> f "finding listener for port %d" port);
-                Some (fun flow -> callback t flow)  in
-              Lwt.return listeners
-          end else begin
-            (* SYNs are only processed via interception; by the time TCP
-               packets for a flow arrive here the flow should be established *)
-            Lwt.return reject_flow
-          end )
-        >>= fun listeners ->
-        Stack_tcp.input tcp4 ~listeners ~src ~dst tcp
+        if Id.Set.mem id t.pending then begin
+          Log.debug (fun f -> f "%s:%d: connection in progress, ignoring duplicate SYN" (Ipaddr.V4.to_string dst) dst_port);
+          Lwt.return_unit
+        end else begin
+          t.pending <- Id.Set.add id t.pending;
+          Lwt.finalize
+            (fun () ->
+              ( if syn then begin
+                  Host.Sockets.Stream.Tcp.connect (dst, dst_port)
+                  >>= function
+                  | `Error (`Msg m) ->
+                    Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string dst) dst_port m);
+                    Lwt.return reject_flow
+                  | `Ok socket ->
+                    let t = { Flow.id; socket = Some socket } in
+                    let listeners port =
+                      Log.debug (fun f -> f "finding listener for port %d" port);
+                      Some (fun flow -> callback t flow)  in
+                    Lwt.return listeners
+                end else begin
+                  (* SYNs are only processed via interception; by the time TCP
+                     packets for a flow arrive here the flow should be established *)
+                  Lwt.return reject_flow
+                end )
+              >>= fun listeners ->
+              Stack_tcp.input t.tcp4 ~listeners ~src ~dst tcp
+            ) (fun () ->
+              t.pending <- Id.Set.remove id t.pending;
+              Lwt.return_unit;
+            )
+        end
 
       let input_ethernet_frame t buffer =
         Stack_ethif.input
           ~arpv4:(Stack_arpv4.input t.arp)
           ~ipv4:(
             Stack_ipv4.input
-              ~tcp:(tcp_input t.tcp4)
+              ~tcp:(tcp_input t)
               ~udp:(fun ~src:_ ~dst:_ _buf -> Lwt.return_unit)
               ~default:(fun ~proto:_ ~src:_ ~dst:_ _ -> Lwt.return_unit)
               t.ipv4)
@@ -270,8 +286,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           Stack_ipv4.set_ip_gateways ipv4 [ ]
           >>= fun () ->
 
-          let flows = Flow.Set.empty in
-          let tcp_stack = { ethif; arp; ipv4; tcp4; flows} in
+          let pending = Id.Set.empty in
+          let flows = Id.Map.empty in
+          let tcp_stack = { ethif; arp; ipv4; tcp4; pending; flows} in
           all := IPMap.add ip tcp_stack !all;
 
           (* Wire up the listeners to receive future packets: *)
