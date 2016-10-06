@@ -165,13 +165,14 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       ack_number: Tcp.Sequence.t;
       syn: bool;
       fin: bool;
+      tcp: Cstruct.t;
       payload: Cstruct.t;
     }
 
     let string_of_packet p =
-      Printf.sprintf "%s sequence=%ld ack_number=%ld syn=%b fin=%b len(payload)=%d"
+      Printf.sprintf "%s sequence=%ld ack_number=%ld syn=%b fin=%b len(tcp)=%d len(payload)=%d"
         (string_of_id p.id) p.sequence (Tcp.Sequence.to_int32 p.ack_number)
-        p.syn p.fin (Cstruct.len p.payload)
+        p.syn p.fin (Cstruct.len p.tcp) (Cstruct.len p.payload)
 
     let parse buf =
       let ipv4       = Cstruct.shift         buf    14                         in
@@ -193,7 +194,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           dest_ip         = src;
           local_ip        = dst;
           dest_port       = src_port } in
-      { id; sequence; ack_number; syn; fin; payload }
+      { id; sequence; ack_number; syn; fin; tcp; payload }
 
     let xmit_rst ip packet =
       let rx_ack = Some (Tcp.Sequence.of_int32 Int32.(add packet.sequence (add (if packet.fin then 1l else 0l) (if packet.syn then 1l else 0l)))) in
@@ -223,9 +224,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         let open Lwt.Infix in
         Stack_ipv4.set_ip ipv4 packet.id.Stack_tcp_wire.local_ip (* I am the destination *)
         >>= fun () ->
-        Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.broadcast (* 255.255.255.255.*)
+        Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
         >>= fun () ->
-        Stack_ipv4.set_ip_gateways ipv4 [ Ipaddr.V4.unspecified ] (* 0.0.0.0 *)
+        Stack_ipv4.set_ip_gateways ipv4 [ ]
         >>= fun () ->
 
         (* If this fails we won't register rule or [tcp] *)
@@ -242,7 +243,24 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           let listeners port =
             Log.debug (fun f -> f "finding listener for port %d" port);
             Some (fun flow -> callback t flow) in
-          Stack_tcp.input tcp4 ~listeners ~src:packet.id.Stack_tcp_wire.dest_ip ~dst:packet.id.Stack_tcp_wire.local_ip packet.payload
+          let input_one_tcp_packet buf =
+            Stack_tcp.input tcp4 ~listeners ~src:packet.id.Stack_tcp_wire.dest_ip ~dst:packet.id.Stack_tcp_wire.local_ip buf in
+          (* Wire up the listeners to receive future packets: *)
+          Switch.Port.listen netif (
+            Stack_ethif.input
+              ~arpv4:(Stack_arpv4.input arp)
+              ~ipv4:(
+                Stack_ipv4.input
+                  ~tcp:(fun ~src:_ ~dst:_ buf -> input_one_tcp_packet buf)
+                  ~udp:(fun ~src:_ ~dst:_ _buf -> Lwt.return_unit)
+                  ~default:(fun ~proto:_ ~src:_ ~dst:_ _ -> Lwt.return_unit)
+                  ipv4)
+              ~ipv6:(fun _ -> Lwt.return_unit)
+              ethif
+          )
+          >>= fun () ->
+          (* inject the SYN we intercepted *)
+          input_one_tcp_packet packet.tcp
           >>= fun () ->
           Lwt.return (`Ok t)
       end

@@ -104,9 +104,11 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     let write t buffer = Netif.write t.netif buffer
     let writev t buffers = Netif.writev t.netif buffers
     let listen t callback =
+      Log.debug (fun f -> f "activating switch port for %s" (Ipaddr.V4.to_string t.rule));
       t.switch.rules <- RuleMap.add t.rule callback t.switch.rules;
       Lwt.return_unit
     let disconnect t =
+      Log.debug (fun f -> f "deactivating switch port for %s" (Ipaddr.V4.to_string t.rule));
       t.switch.rules <- RuleMap.remove t.rule t.switch.rules;
       Lwt.return_unit
 
