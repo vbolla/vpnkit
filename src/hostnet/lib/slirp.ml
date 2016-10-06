@@ -7,6 +7,9 @@ let src =
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
+module IPMap = Map.Make(Ipaddr.V4)
+module IntMap = Map.Make(struct type t = int let compare (a:int) (b:int) = compare a b end)
+
 let client_macaddr = Macaddr.of_string_exn "C0:FF:EE:C0:FF:EE"
 (* random MAC from https://www.hellion.org.uk/cgi-bin/randmac.pl *)
 let server_macaddr = Macaddr.of_string_exn "F6:16:36:BC:F9:C6"
@@ -117,153 +120,166 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let open Match in
     ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
 
-  let is_tcp_syn =
+  let is_tcp =
     let open Match in
-    ethernet @@ ipv4 () @@ tcp ~syn:true () all
+    ethernet @@ ipv4 () @@ tcp () all
+
+  let string_of_id id =
+    Printf.sprintf "TCP %s:%d > %s:%d"
+      (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) id.Stack_tcp_wire.dest_port
+      (Ipaddr.V4.to_string id.Stack_tcp_wire.local_ip) id.Stack_tcp_wire.local_port
 
   module Tcp = struct
-    type t = {
-      id: Stack_tcp_wire.id;
-      mutable socket: Host.Sockets.Stream.Tcp.flow option;
-    }
 
-    let string_of_id id =
-      Printf.sprintf "TCP %s:%d > %s:%d"
-        (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) id.Stack_tcp_wire.dest_port
-        (Ipaddr.V4.to_string id.Stack_tcp_wire.local_ip) id.Stack_tcp_wire.local_port
+    module Flow = struct
+      (** An established flow *)
 
-    let to_string t =
-      Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
+      module M = struct
+        type t = {
+          id: Stack_tcp_wire.id;
+          mutable socket: Host.Sockets.Stream.Tcp.flow option;
+        }
 
-    module Map = Map.Make(Ipaddr.V4)
-    let all = ref Map.empty
+        let to_string t =
+          Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
 
-    let callback t tcpv4 = match t.socket with
-      | None ->
-        Log.err (fun f -> f "%s callback called on closed socket" (to_string t));
-        Lwt.return_unit
-      | Some socket ->
-        Lwt.finalize
-          (fun () ->
-            Mirage_flow.proxy (module Clock) (module Stack_tcp) tcpv4 (module Host.Sockets.Stream.Tcp) socket ()
+        let compare
+          { id = { Stack_tcp_wire.local_ip = local_ip1; local_port = local_port1; dest_ip = dest_ip1; dest_port = dest_port1 }; _}
+          { id = { Stack_tcp_wire.local_ip = local_ip2; local_port = local_port2; dest_ip = dest_ip2; dest_port = dest_port2 }; _} =
+          let dest_ip' = Ipaddr.V4.compare dest_ip1 dest_ip2 in
+          let local_ip' = Ipaddr.V4.compare local_ip1 local_ip2 in
+          let dest_port' = compare dest_port1 dest_port2 in
+          let local_port' = compare local_port1 local_port2 in
+          if dest_port' <> 0
+          then dest_port'
+          else if dest_ip' <> 0
+          then dest_ip'
+          else if local_ip' <> 0
+          then local_ip'
+          else local_port'
+      end
+      include M
+      module Set = Set.Make(M)
+    end
+
+    module Stack = struct
+
+      type t = {
+        ethif:           Stack_ethif.t;
+        arp:             Stack_arpv4.t;
+        ipv4:            Stack_ipv4.t;
+        tcp4:            Stack_tcp.t;
+        mutable flows:   Flow.Set.t;
+      }
+
+      let all : t IPMap.t ref = ref IPMap.empty
+
+      let callback t tcpv4 = match t.Flow.socket with
+        | None ->
+          Log.err (fun f -> f "%s callback called on closed socket" (Flow.to_string t));
+          Lwt.return_unit
+        | Some socket ->
+          Lwt.finalize
+            (fun () ->
+              Mirage_flow.proxy (module Clock) (module Stack_tcp) tcpv4 (module Host.Sockets.Stream.Tcp) socket ()
+              >>= function
+              | `Error (`Msg m) ->
+                Log.err (fun f -> f "%s proxy failed with %s" (Flow.to_string t) m);
+                Lwt.return_unit
+              | `Ok (_l_stats, _r_stats) ->
+                Lwt.return_unit
+            ) (fun () ->
+              t.Flow.socket <- None;
+              Host.Sockets.Stream.Tcp.close socket
+              >>= fun () ->
+              Lwt.return_unit
+            )
+
+      (* Pre-parse incoming TCP packets and for every SYN, attempt to make the
+         on-going connection before handing the packet to the stack. *)
+      let tcp_input tcp4 ~src ~dst tcp =
+        let reject_flow port =
+          Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
+          None in
+        let flags      = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
+        let src_port   = Cstruct.BE.get_uint16 tcp    0                          in
+        let dst_port   = Cstruct.BE.get_uint16 tcp    2                          in
+        let syn        = (flags land (1 lsl 1)) > 0 in
+        let id =
+          { Stack_tcp_wire.local_port = dst_port;
+            dest_ip         = src;
+            local_ip        = dst;
+            dest_port       = src_port } in
+        ( if syn then begin
+            (* FIXME: we need to ignore SYNs for this port while we're blocked connecting *)
+            Host.Sockets.Stream.Tcp.connect (dst, dst_port)
             >>= function
             | `Error (`Msg m) ->
-              Log.err (fun f -> f "%s proxy failed with %s" (to_string t) m);
-              Lwt.return_unit
-            | `Ok (_l_stats, _r_stats) ->
-              Lwt.return_unit
-          ) (fun () ->
-            t.socket <- None;
-            Host.Sockets.Stream.Tcp.close socket
-            >>= fun () ->
-            Lwt.return_unit
-          )
+              Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string dst) dst_port m);
+              Lwt.return reject_flow
+            | `Ok socket ->
+              let t = { Flow.id; socket = Some socket } in
+              let listeners port =
+                Log.debug (fun f -> f "finding listener for port %d" port);
+                Some (fun flow -> callback t flow)  in
+              Lwt.return listeners
+          end else begin
+            (* SYNs are only processed via interception; by the time TCP
+               packets for a flow arrive here the flow should be established *)
+            Lwt.return reject_flow
+          end )
+        >>= fun listeners ->
+        Stack_tcp.input tcp4 ~listeners ~src ~dst tcp
 
-    type packet = {
-      id: Stack_tcp_wire.id;
-      sequence: int32;
-      ack_number: Tcp.Sequence.t;
-      syn: bool;
-      fin: bool;
-      tcp: Cstruct.t;
-      payload: Cstruct.t;
-    }
+      let input_ethernet_frame t buffer =
+        Stack_ethif.input
+          ~arpv4:(Stack_arpv4.input t.arp)
+          ~ipv4:(
+            Stack_ipv4.input
+              ~tcp:(tcp_input t.tcp4)
+              ~udp:(fun ~src:_ ~dst:_ _buf -> Lwt.return_unit)
+              ~default:(fun ~proto:_ ~src:_ ~dst:_ _ -> Lwt.return_unit)
+              t.ipv4)
+          ~ipv6:(fun _ -> Lwt.return_unit)
+          t.ethif buffer
 
-    let string_of_packet p =
-      Printf.sprintf "%s sequence=%ld ack_number=%ld syn=%b fin=%b len(tcp)=%d len(payload)=%d"
-        (string_of_id p.id) p.sequence (Tcp.Sequence.to_int32 p.ack_number)
-        p.syn p.fin (Cstruct.len p.tcp) (Cstruct.len p.payload)
+      let of_ip switch arp_table ip =
+      (* FIXME: serialise this to prevent setting up the same stack in parallel *)
+        if IPMap.mem ip !all
+        then Lwt.return (`Ok (IPMap.find ip !all))
+        else begin
+          let netif = Switch.port switch ip in
+          let open Infix in
+          or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+          >>= fun ethif ->
+          or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+          >>= fun arp ->
+          or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+          >>= fun ipv4 ->
+          or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+          >>= fun _udp4 ->
+          or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+          >>= fun tcp4 ->
 
-    let parse buf =
-      let ipv4       = Cstruct.shift         buf    14                         in
-      let src        = Cstruct.BE.get_uint32 ipv4   12 |> Ipaddr.V4.of_int32   in
-      let dst        = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
-      let vihl       = Cstruct.get_uint8     ipv4   0                          in
-      let tcp        = Cstruct.shift         ipv4   (4 * (vihl land 0xf))      in
-      let src_port   = Cstruct.BE.get_uint16 tcp    0                          in
-      let dst_port   = Cstruct.BE.get_uint16 tcp    2                          in
-      let flags      = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
-      let sequence   = Cstruct.BE.get_uint32 tcp    4                          in
-      let ack_number = Cstruct.BE.get_uint32 tcp    8 |> Tcp.Sequence.of_int32 in
-      let payload    = Cstruct.shift         tcp    16                         in
-
-      let fin       = (flags land (1 lsl 0)) > 0 in
-      let syn       = (flags land (1 lsl 1)) > 0 in
-      let id =
-        { Stack_tcp_wire.local_port = dst_port;
-          dest_ip         = src;
-          local_ip        = dst;
-          dest_port       = src_port } in
-      { id; sequence; ack_number; syn; fin; tcp; payload }
-
-    let xmit_rst ip packet =
-      let rx_ack = Some (Tcp.Sequence.of_int32 Int32.(add packet.sequence (add (if packet.fin then 1l else 0l) (if packet.syn then 1l else 0l)))) in
-      Log.debug (fun f -> f "xmit_rst %s" (string_of_packet packet));
-      Stack_tcp_wire.xmit ~ip ~id:packet.id ~rst:true ~rx_ack ~seq:packet.ack_number ~window:0 ~options:[] []
-
-    let process_syn switch arp_table buf =
-      let packet = parse buf in
-      Log.debug (fun f -> f "process_syn %s" (string_of_packet packet));
-
-      if Map.mem packet.id.Stack_tcp_wire.local_ip !all
-      then Lwt.return (`Ok (Map.find packet.id.Stack_tcp_wire.local_ip !all))
-      else begin
-        let netif = Switch.port switch packet.id.Stack_tcp_wire.local_ip in
-        let open Infix in
-        or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
-        >>= fun ethif ->
-        or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
-        >>= fun arp ->
-        or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
-        >>= fun ipv4 ->
-        or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
-        >>= fun _udp4 ->
-        or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
-        >>= fun tcp4 ->
-
-        let open Lwt.Infix in
-        Stack_ipv4.set_ip ipv4 packet.id.Stack_tcp_wire.local_ip (* I am the destination *)
-        >>= fun () ->
-        Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
-        >>= fun () ->
-        Stack_ipv4.set_ip_gateways ipv4 [ ]
-        >>= fun () ->
-
-        (* If this fails we won't register rule or [tcp] *)
-        Host.Sockets.Stream.Tcp.connect (packet.id.Stack_tcp_wire.local_ip, packet.id.Stack_tcp_wire.local_port)
-        >>= function
-        | `Error (`Msg m) ->
-          Log.err (fun f -> f "Failed to connect to %s:%d, sending RST" (Ipaddr.V4.to_string packet.id.Stack_tcp_wire.local_ip) packet.id.Stack_tcp_wire.local_port);
-          xmit_rst ipv4 packet
+          let open Lwt.Infix in
+          Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
           >>= fun () ->
-          Lwt.return (`Error (`Msg m))
-        | `Ok socket ->
-          let t = { id = packet.id; socket = Some socket } in
-          (* FIXME: this needs to handle more than one connection to the same IP *)
-          let listeners port =
-            Log.debug (fun f -> f "finding listener for port %d" port);
-            Some (fun flow -> callback t flow) in
-          let input_one_tcp_packet buf =
-            Stack_tcp.input tcp4 ~listeners ~src:packet.id.Stack_tcp_wire.dest_ip ~dst:packet.id.Stack_tcp_wire.local_ip buf in
+          Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
+          >>= fun () ->
+          Stack_ipv4.set_ip_gateways ipv4 [ ]
+          >>= fun () ->
+
+          let flows = Flow.Set.empty in
+          let tcp_stack = { ethif; arp; ipv4; tcp4; flows} in
+          all := IPMap.add ip tcp_stack !all;
+
           (* Wire up the listeners to receive future packets: *)
-          Switch.Port.listen netif (
-            Stack_ethif.input
-              ~arpv4:(Stack_arpv4.input arp)
-              ~ipv4:(
-                Stack_ipv4.input
-                  ~tcp:(fun ~src:_ ~dst:_ buf -> input_one_tcp_packet buf)
-                  ~udp:(fun ~src:_ ~dst:_ _buf -> Lwt.return_unit)
-                  ~default:(fun ~proto:_ ~src:_ ~dst:_ _ -> Lwt.return_unit)
-                  ipv4)
-              ~ipv6:(fun _ -> Lwt.return_unit)
-              ethif
-          )
+          Switch.Port.listen netif (input_ethernet_frame tcp_stack)
           >>= fun () ->
-          (* inject the SYN we intercepted *)
-          input_one_tcp_packet packet.tcp
-          >>= fun () ->
-          Lwt.return (`Ok t)
-      end
+
+          Lwt.return (`Ok tcp_stack)
+        end
+    end
   end
 
 let connect x peer_ip local_ip extra_dns_ip get_domain_search =
@@ -307,16 +323,19 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
         Log.debug (fun f -> f "ARP REQUEST");
         (* Arp.input expects only the ARP packet, with no ethernet header prefix *)
         Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
-      end else if Match.bufs is_tcp_syn [ buf ] then begin
-        Log.debug (fun f -> f "TCP SYN D3T3CT3D");
-        Tcp.process_syn switch arp_table buf
+      end else if Match.bufs is_tcp [ buf ] then begin
+        (* For any new TCP packet, create a stack to proxy for the remote system *)
+        Log.debug (fun f -> f "TCP D3T3CT3D");
+        let ipv4       = Cstruct.shift         buf    14                         in
+        let dst        = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
+        Tcp.Stack.of_ip switch arp_table dst
         >>= function
         | `Error (`Msg m) ->
-          Log.debug (fun f -> f "%s: SENT RESET" m);
+          Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
           Lwt.return_unit
-        | `Ok _tcp ->
-          Log.debug (fun f -> f "continuing handshake");
-          Lwt.return_unit
+        | `Ok tcp_stack ->
+          (* inject the ethernet frame into the new stack *)
+          Tcp.Stack.input_ethernet_frame tcp_stack buf
       end else begin
         Cstruct.hexdump buf;
         Lwt.return_unit
