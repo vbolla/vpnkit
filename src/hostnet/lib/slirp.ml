@@ -159,11 +159,14 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           )
 
     let process_syn switch arp_table buf =
-      let src = failwith "src" in
-      let dst = failwith "dst" in
-      let src_port = failwith "src_port" in
-      let dst_port = failwith "dst_port" in
-      let payload = failwith "payload" in
+      let ipv4      = Cstruct.shift         buf     14                       in
+      let src       = Cstruct.BE.get_uint32 ipv4    12 |> Ipaddr.V4.of_int32 in
+      let dst       = Cstruct.BE.get_uint32 ipv4    16 |> Ipaddr.V4.of_int32 in
+      let vihl      = Cstruct.get_uint8     ipv4    0                        in
+      let tcp       = Cstruct.shift         ipv4    (4 * (vihl land 0xf))    in
+      let src_port  = Cstruct.BE.get_uint16 tcp     0                        in
+      let dst_port  = Cstruct.BE.get_uint16 tcp     2                        in
+      let payload   = Cstruct.shift         tcp     16                       in
 
       if Map.mem dst !all
       then Lwt.return (`Ok (Map.find dst !all))
