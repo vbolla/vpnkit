@@ -76,7 +76,15 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Stack_arpv4 = Arp.Make(Stack_ethif)
   module Stack_ipv4 = Ipv4.Make(Stack_ethif)(Stack_arpv4)
   module Stack_udp = Udp.Make(Stack_ipv4)
-  module Stack_tcp = Tcp.Flow.Make(Stack_ipv4)(Host.Time)(Clock)(Random)
+  module Stack_tcp = struct
+    include Tcp.Flow.Make(Stack_ipv4)(Host.Time)(Clock)(Random)
+    let shutdown_read _flow =
+      (* No change to the TCP PCB: all this means is that I've
+         got my finders in my ears and am nolonger listening to
+         what you say. *)
+      Lwt.return ()
+    let shutdown_write = close
+  end
 
   (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
 
@@ -114,21 +122,53 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Tcp = struct
     type t = {
-      ip: Ipaddr.V4.t;
-      socket: Host.Sockets.Stream.Tcp.flow;
-      tcp4: Stack_tcp.t;
+      src: Ipaddr.V4.t;
+      dst: Ipaddr.V4.t;
+      src_port: int;
+      dst_port: int;
+      mutable socket: Host.Sockets.Stream.Tcp.flow option;
     }
+
+    let to_string t =
+      Printf.sprintf "TCP %s:%d > %s:%d"
+        (Ipaddr.V4.to_string t.src) t.src_port
+        (Ipaddr.V4.to_string t.dst) t.dst_port
+
     module Map = Map.Make(Ipaddr.V4)
     let all = ref Map.empty
 
-    let process_syn switch arp_table buf =
-      let ip = failwith "ip" in
-      let port = failwith "port" in
+    let callback t tcpv4 = match t.socket with
+      | None ->
+        Log.err (fun f -> f "%s callback called on closed socket" (to_string t));
+        Lwt.return_unit
+      | Some socket ->
+        Lwt.finalize
+          (fun () ->
+            Mirage_flow.proxy (module Clock) (module Stack_tcp) tcpv4 (module Host.Sockets.Stream.Tcp) socket ()
+            >>= function
+            | `Error (`Msg m) ->
+              Log.err (fun f -> f "%s proxy failed with %s" (to_string t) m);
+              Lwt.return_unit
+            | `Ok (_l_stats, _r_stats) ->
+              Lwt.return_unit
+          ) (fun () ->
+            t.socket <- None;
+            Host.Sockets.Stream.Tcp.close socket
+            >>= fun () ->
+            Lwt.return_unit
+          )
 
-      if Map.mem ip !all
-      then Lwt.return (`Ok (Map.find ip !all))
+    let process_syn switch arp_table buf =
+      let src = failwith "src" in
+      let dst = failwith "dst" in
+      let src_port = failwith "src_port" in
+      let dst_port = failwith "dst_port" in
+      let payload = failwith "payload" in
+
+      if Map.mem dst !all
+      then Lwt.return (`Ok (Map.find dst !all))
       else begin
-        let netif = Switch.port switch ip in
+        let netif = Switch.port switch dst in
         let open Infix in
         or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
         >>= fun ethif ->
@@ -142,7 +182,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         >>= fun tcp4 ->
 
         let open Lwt.Infix in
-        Stack_ipv4.set_ip ipv4 ip
+        Stack_ipv4.set_ip ipv4 dst (* I am the destination *)
         >>= fun () ->
         Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.broadcast (* 255.255.255.255.*)
         >>= fun () ->
@@ -150,9 +190,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         >>= fun () ->
 
         let open Infix in
-        Host.Sockets.Stream.Tcp.connect (ip, port)
+        (* If this fails we won't register rule or [tcp] *)
+        Host.Sockets.Stream.Tcp.connect (dst, dst_port)
         >>= fun socket ->
-        Lwt.return (`Ok { ip; socket; tcp4 })
+        let t = { src; dst; src_port; dst_port; socket = Some socket } in
+        (* FIXME: this needs to handle more than one connection to the same IP *)
+        let listeners port =
+          Log.debug (fun f -> f "finding listener for port %d" port);
+          Some (fun flow -> callback t flow) in
+        let open Lwt.Infix in
+        Stack_tcp.input tcp4 ~listeners ~src ~dst payload
+        >>= fun () ->
+        Lwt.return (`Ok t)
       end
   end
 
