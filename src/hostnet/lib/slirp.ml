@@ -131,35 +131,36 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Tcp = struct
 
+    module Id = struct
+      type t = Stack_tcp_wire.id
+      let compare
+        { Stack_tcp_wire.local_ip = local_ip1; local_port = local_port1; dest_ip = dest_ip1; dest_port = dest_port1 }
+        { Stack_tcp_wire.local_ip = local_ip2; local_port = local_port2; dest_ip = dest_ip2; dest_port = dest_port2 } =
+        let dest_ip' = Ipaddr.V4.compare dest_ip1 dest_ip2 in
+        let local_ip' = Ipaddr.V4.compare local_ip1 local_ip2 in
+        let dest_port' = compare dest_port1 dest_port2 in
+        let local_port' = compare local_port1 local_port2 in
+        if dest_port' <> 0
+        then dest_port'
+        else if dest_ip' <> 0
+        then dest_ip'
+        else if local_ip' <> 0
+        then local_ip'
+        else local_port'
+    end
+
     module Flow = struct
       (** An established flow *)
 
-      module M = struct
-        type t = {
-          id: Stack_tcp_wire.id;
-          mutable socket: Host.Sockets.Stream.Tcp.flow option;
-        }
+      type t = {
+        id: Stack_tcp_wire.id;
+        mutable socket: Host.Sockets.Stream.Tcp.flow option;
+      }
 
-        let to_string t =
-          Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
+      let to_string t =
+        Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
 
-        let compare
-          { id = { Stack_tcp_wire.local_ip = local_ip1; local_port = local_port1; dest_ip = dest_ip1; dest_port = dest_port1 }; _}
-          { id = { Stack_tcp_wire.local_ip = local_ip2; local_port = local_port2; dest_ip = dest_ip2; dest_port = dest_port2 }; _} =
-          let dest_ip' = Ipaddr.V4.compare dest_ip1 dest_ip2 in
-          let local_ip' = Ipaddr.V4.compare local_ip1 local_ip2 in
-          let dest_port' = compare dest_port1 dest_port2 in
-          let local_port' = compare local_port1 local_port2 in
-          if dest_port' <> 0
-          then dest_port'
-          else if dest_ip' <> 0
-          then dest_ip'
-          else if local_ip' <> 0
-          then local_ip'
-          else local_port'
-      end
-      include M
-      module Set = Set.Make(M)
+      module Set = Set.Make(Id)
     end
 
     module Stack = struct
