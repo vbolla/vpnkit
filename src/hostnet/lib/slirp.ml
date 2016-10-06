@@ -75,6 +75,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Stack_ethif = Ethif.Make(Switch.Port)
   module Stack_arpv4 = Arp.Make(Stack_ethif)
   module Stack_ipv4 = Ipv4.Make(Stack_ethif)(Stack_arpv4)
+  module Stack_tcp_wire = Tcp.Wire.Make(Stack_ipv4)
   module Stack_udp = Udp.Make(Stack_ipv4)
   module Stack_tcp = struct
     include Tcp.Flow.Make(Stack_ipv4)(Host.Time)(Clock)(Random)
@@ -158,6 +159,32 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             Lwt.return_unit
           )
 
+    let xmit_rst ip buf =
+      let ipv4      = Cstruct.shift         buf    14                         in
+      let src       = Cstruct.BE.get_uint32 ipv4   12 |> Ipaddr.V4.of_int32   in
+      let dst       = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
+      let vihl      = Cstruct.get_uint8     ipv4   0                          in
+      let tcp       = Cstruct.shift         ipv4   (4 * (vihl land 0xf))      in
+      let src_port  = Cstruct.BE.get_uint16 tcp    0                          in
+      let dst_port  = Cstruct.BE.get_uint16 tcp    2                          in
+      let flags     = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
+      let sequence  = Cstruct.BE.get_uint32 tcp    4                          in
+      let seq       = Cstruct.BE.get_uint32 tcp    8 |> Tcp.Sequence.of_int32 in
+
+      let fin       = (flags land (1 lsl 0)) > 0 in
+      let syn       = (flags land (1 lsl 1)) > 0 in
+      let rx_ack    = Some (Tcp.Sequence.of_int32 Int32.(add sequence (add (if fin then 1l else 0l) (if syn then 1l else 0l)))) in
+      let id =
+        { Stack_tcp_wire.local_port = dst_port;
+          dest_ip         = src;
+          local_ip        = dst;
+          dest_port       = src_port } in
+      Log.debug (fun f -> f "xmit_rst src=%s dst=%s vihl=%d src_port=%d dst_port=%d"
+        (Ipaddr.V4.to_string src) (Ipaddr.V4.to_string dst)
+        vihl src_port dst_port
+      );
+      Stack_tcp_wire.xmit ~ip ~id ~rst:true ~rx_ack ~seq ~window:0 ~options:[] []
+
     let process_syn switch arp_table buf =
       let ipv4      = Cstruct.shift         buf     14                       in
       let src       = Cstruct.BE.get_uint32 ipv4    12 |> Ipaddr.V4.of_int32 in
@@ -167,6 +194,10 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       let src_port  = Cstruct.BE.get_uint16 tcp     0                        in
       let dst_port  = Cstruct.BE.get_uint16 tcp     2                        in
       let payload   = Cstruct.shift         tcp     16                       in
+      Log.debug (fun f -> f "process_syn src=%s dst=%s vihl=%d src_port=%d dst_port=%d len(payload)=%d"
+        (Ipaddr.V4.to_string src) (Ipaddr.V4.to_string dst)
+        vihl src_port dst_port (Cstruct.len payload)
+      );
 
       if Map.mem dst !all
       then Lwt.return (`Ok (Map.find dst !all))
@@ -192,19 +223,23 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         Stack_ipv4.set_ip_gateways ipv4 [ Ipaddr.V4.unspecified ] (* 0.0.0.0 *)
         >>= fun () ->
 
-        let open Infix in
         (* If this fails we won't register rule or [tcp] *)
         Host.Sockets.Stream.Tcp.connect (dst, dst_port)
-        >>= fun socket ->
-        let t = { src; dst; src_port; dst_port; socket = Some socket } in
-        (* FIXME: this needs to handle more than one connection to the same IP *)
-        let listeners port =
-          Log.debug (fun f -> f "finding listener for port %d" port);
-          Some (fun flow -> callback t flow) in
-        let open Lwt.Infix in
-        Stack_tcp.input tcp4 ~listeners ~src ~dst payload
-        >>= fun () ->
-        Lwt.return (`Ok t)
+        >>= function
+        | `Error (`Msg m) ->
+          Log.err (fun f -> f "Failed to connect to %s:%d, sending RST" (Ipaddr.V4.to_string dst) dst_port);
+          xmit_rst ipv4 buf
+          >>= fun () ->
+          Lwt.return (`Error (`Msg m))
+        | `Ok socket ->
+          let t = { src; dst; src_port; dst_port; socket = Some socket } in
+          (* FIXME: this needs to handle more than one connection to the same IP *)
+          let listeners port =
+            Log.debug (fun f -> f "finding listener for port %d" port);
+            Some (fun flow -> callback t flow) in
+          Stack_tcp.input tcp4 ~listeners ~src ~dst payload
+          >>= fun () ->
+          Lwt.return (`Ok t)
       end
   end
 
@@ -254,7 +289,7 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
         Tcp.process_syn switch arp_table buf
         >>= function
         | `Error (`Msg m) ->
-          Log.debug (fun f -> f "%s: SENDING RESET" m);
+          Log.debug (fun f -> f "%s: SENT RESET" m);
           Lwt.return_unit
         | `Ok _tcp ->
           Log.debug (fun f -> f "continuing handshake");
