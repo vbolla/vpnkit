@@ -440,18 +440,24 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
   (* Add a listener which looks for new flows *)
   Switch.listen switch
     (fun buf ->
-      if Match.bufs is_dhcp [ buf ]
-      then Dhcp.callback dhcp buf
-      else if Match.bufs is_arp_request [ buf ] then begin
+      let open Frame in
+      match parse buf with
+      | Ok (Ethernet { payload = Ipv4 { dst = 67; _ }; _ }) ->
+        Dhcp.callback dhcp buf
+      | Ok (Ethernet { payload = Ipv4 { dst = 68; _ }; _ }) ->
+        Dhcp.callback dhcp buf
+        (*
+      | Ok (Ethernet { payload = Arp { op = `Request }; _ }) ->
         Log.debug (fun f -> f "ARP REQUEST");
         (* Arp.input expects only the ARP packet, with no ethernet header prefix *)
         Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
-      end else if Match.bufs is_tcp_or_udp [ buf ] then begin
+      | Ok (Ethernet { payload = Ipv4 { payload = Udp { payload = _ }; _ }; _})
+      | Ok (Ethernet { payload = Ipv4 { payload = Tcp { payload = _ }; _ }; _}) ->
         (* For any new TCP packet, create a stack to proxy for the remote system *)
         Log.debug (fun f -> f "TCP or UDP D3T3CT3D");
         let ipv4       = Cstruct.shift         buf    14                         in
         let dst        = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
-        Stack.of_ip switch arp_table dst
+        begin Stack.of_ip switch arp_table dst
         >>= function
         | `Error (`Msg m) ->
           Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
@@ -459,10 +465,11 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
         | `Ok tcp_stack ->
           (* inject the ethernet frame into the new stack *)
           Stack.input_ethernet_frame tcp_stack buf
-      end else begin
+        end
+        *)
+      | _ ->
         Cstruct.hexdump buf;
         Lwt.return_unit
-      end
     )
   >>= fun () ->
 (*
