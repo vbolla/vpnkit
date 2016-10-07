@@ -251,7 +251,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       end
 
     (* Parse ethernet frames which contain a UDP datagram *)
-    let udp_input t ~src ~dst buf =
+    let udp_input t ~src:_ ~dst:_ buf =
       match (Wire_structs.parse_ethernet_frame buf) with
       | Some (Some Wire_structs.IPv4, _, payload) ->
         let src = Ipaddr.V4.of_int32 @@ Wire_structs.Ipv4_wire.get_ipv4_src payload in
@@ -351,6 +351,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             end
           | _ -> Lwt.return_unit
         end
+      | _ -> Lwt.return_unit
 
     (* Process a single ethernet frame *)
     let input_ethernet_frame t buffer =
