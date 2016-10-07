@@ -90,7 +90,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let shutdown_write = close
   end
 
-  (* module Dns_forwarder = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time) *)
+  module Dns_forwarder = Dns_forward.Make(Stack_ipv4)(Stack_udp)(Resolv_conf)(Host.Sockets)(Host.Time)
 
   type t = {
     after_disconnect: unit Lwt.t;
@@ -194,6 +194,52 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       Lwt.return (`Ok tcp_stack)
   end
 
+  open Frame
+
+  module Local = struct
+    type t = {
+      endpoint: Endpoint.t;
+    }
+    (** Represents the local machine including NTP and DNS servers *)
+
+    (** Handle IPv4 datagrams by proxying them to a remote system *)
+    let input_ipv4 t ipv4 = match ipv4 with
+      | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 53; payload = Payload payload; _ }; _ } ->
+        let nth = failwith "nth?" in
+        let udp = t.endpoint.Endpoint.udp4 in
+        Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
+      | Ipv4 { src = _; dst = _; payload = Tcp { src = _; dst = 53; payload = Payload _; _ }; _ } ->
+        failwith "TCP DNS"
+      | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 123; payload = Payload payload; _ }; _ } ->
+        let localhost = Ipaddr.V4.localhost in
+        Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost 123);
+        let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:123 ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
+        Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, 123) ~payload ()
+      | _ ->
+        failwith "other local traffic"
+
+    let create switch arp_table ip =
+      let open Infix in
+      Endpoint.create switch arp_table ip
+      >>= fun endpoint ->
+
+      let tcp_stack = { endpoint } in
+
+      let open Lwt.Infix in
+      (* Wire up the listeners to receive future packets: *)
+      Switch.Port.listen endpoint.Endpoint.netif
+        (fun buf ->
+          let open Frame in
+          match parse buf with
+          | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
+          | _ -> Lwt.return_unit
+        )
+      >>= fun () ->
+
+      Lwt.return (`Ok tcp_stack)
+
+  end
+
   module Remote = struct
 
     type t = {
@@ -226,7 +272,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             Lwt.return_unit
           )
 
-    open Frame
 
 
 
@@ -412,6 +457,19 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
   >>= fun global_arp_ethif ->
   or_failwith "arp" @@ Global_arp.connect ~table:arp_table global_arp_ethif
   >>= fun arp ->
+
+  (* Listen on local IPs *)
+  Lwt_list.iter_s
+    (fun ip ->
+      Local.create switch arp_table ip
+      >>= function
+      | `Error (`Msg m) ->
+        Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
+        Lwt.return_unit
+      | `Ok _ ->
+        Lwt.return_unit
+    ) (local_ip :: extra_dns_ip)
+  >>= fun () ->
 
   let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
 
