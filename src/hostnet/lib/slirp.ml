@@ -108,21 +108,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         ]
       )
 
-  let is_dhcp =
-    let open Match in
-    ethernet @@ ipv4 () @@ ((udp ~dst:67 () all) or (udp ~dst:68 () all))
-
-  let is_arp_request =
-    let open Match in
-    ethernet @@ arp ~opcode:`Request ()
-
   let is_dns =
     let open Match in
     ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
-
-  let is_tcp_or_udp =
-    let open Match in
-    ethernet @@ ipv4 () @@ ((tcp () all) or (udp () all))
 
   let string_of_id id =
     Printf.sprintf "TCP %s:%d > %s:%d"
@@ -203,117 +191,10 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             Lwt.return_unit
           )
 
-    (* Pre-parse incoming TCP packets and for every SYN, attempt to make the
-       on-going connection before handing the packet to the stack. *)
-    let tcp_input t ~src ~dst tcp =
-      let reject_flow port =
-        Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
-        None in
-      let flags      = Cstruct.get_uint8     tcp    (2 + 2 + 4 + 4 + 1)        in
-      let src_port   = Cstruct.BE.get_uint16 tcp    0                          in
-      let dst_port   = Cstruct.BE.get_uint16 tcp    2                          in
-      let syn        = (flags land (1 lsl 1)) > 0 in
-      let id =
-        { Stack_tcp_wire.local_port = dst_port;
-          dest_ip         = src;
-          local_ip        = dst;
-          dest_port       = src_port } in
-      if Tcp.Id.Set.mem id t.pending then begin
-        Log.debug (fun f -> f "%s:%d: connection in progress, ignoring duplicate SYN" (Ipaddr.V4.to_string dst) dst_port);
-        Lwt.return_unit
-      end else begin
-        t.pending <- Tcp.Id.Set.add id t.pending;
-        Lwt.finalize
-          (fun () ->
-            ( if syn then begin
-                Host.Sockets.Stream.Tcp.connect (dst, dst_port)
-                >>= function
-                | `Error (`Msg m) ->
-                  Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string dst) dst_port m);
-                  Lwt.return reject_flow
-                | `Ok socket ->
-                  let t = { Tcp.Flow.id; socket = Some socket } in
-                  let listeners port =
-                    Log.debug (fun f -> f "finding listener for port %d" port);
-                    Some (fun flow -> callback t flow)  in
-                  Lwt.return listeners
-              end else begin
-                (* SYNs are only processed via interception; by the time TCP
-                   packets for a flow arrive here the flow should be established *)
-                Lwt.return reject_flow
-              end )
-            >>= fun listeners ->
-            Stack_tcp.input t.tcp4 ~listeners ~src ~dst tcp
-          ) (fun () ->
-            t.pending <- Tcp.Id.Set.remove id t.pending;
-            Lwt.return_unit;
-          )
-      end
+    open Frame
 
-    (* Parse ethernet frames which contain a UDP datagram *)
-    let udp_input t ~src:_ ~dst:_ buf =
-      match (Wire_structs.parse_ethernet_frame buf) with
-      | Some (Some Wire_structs.IPv4, _, payload) ->
-        let src = Ipaddr.V4.of_int32 @@ Wire_structs.Ipv4_wire.get_ipv4_src payload in
-        let dst = Ipaddr.V4.of_int32 @@ Wire_structs.Ipv4_wire.get_ipv4_dst payload in
-        begin match Wire_structs.Ipv4_wire.(int_to_protocol @@ get_ipv4_proto payload) with
-          | Some `UDP ->
-            let hlen_version = Wire_structs.Ipv4_wire.get_ipv4_hlen_version payload in
-            let ihl = hlen_version land 0xf in
-            let udp = Cstruct.shift payload (ihl * 4) in
-            let src_port = Wire_structs.get_udp_source_port udp in
-            let dst_port = Wire_structs.get_udp_dest_port udp in
-            let length = Wire_structs.get_udp_length udp in
-            let flags_fragment_offset = Wire_structs.Ipv4_wire.get_ipv4_off payload in
-            let dnf = ((flags_fragment_offset lsr 8) land 0x40) <> 0 in
-            if Cstruct.len udp < length then begin
-              Log.err (fun f -> f "Dropping UDP %s:%d -> %s:%d reported len %d actual len %d"
-                           (Ipaddr.V4.to_string src) src_port
-                           (Ipaddr.V4.to_string dst) dst_port
-                           length (Cstruct.len udp));
-              Lwt.return_unit
-            end else if dnf && (Cstruct.len payload > mtu) then begin
-              let would_fragment ~ip_header ~ip_payload =
-                let open Wire_structs.Ipv4_wire in
-                let header = Cstruct.create sizeof_icmpv4 in
-                set_icmpv4_ty header 0x03;
-                set_icmpv4_code header 0x04;
-                set_icmpv4_csum header 0x0000;
-                (* this field is unused for icmp destination unreachable *)
-                set_icmpv4_id header 0x00;
-                set_icmpv4_seq header mtu;
-                let icmp_payload = match ip_payload with
-                  | Some ip_payload ->
-                    if (Cstruct.len ip_payload > 8) then begin
-                      let ip_payload = Cstruct.sub ip_payload 0 8 in
-                      Cstruct.append ip_header ip_payload
-                    end else Cstruct.append ip_header ip_payload
-                  | None -> ip_header
-                in
-                set_icmpv4_csum header
-                  (Tcpip_checksum.ones_complement_list [ header;
-                                                         icmp_payload ]);
-                let icmp_packet = Cstruct.append header icmp_payload in
-                icmp_packet
-              in
-              let ethernet_frame, len = Stack_ipv4.allocate t.ipv4
-                ~src:dst ~dst:src ~proto:`ICMP in
-              let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
 
-              let reply = would_fragment
-                  ~ip_header:(Cstruct.sub payload 0 (ihl * 4))
-                  ~ip_payload:(Some (Cstruct.sub payload (ihl * 4) 8)) in
-              (* Rather than silently unset the do not fragment bit, we
-                 respond with an ICMP error message which will
-                 hopefully prompt the other side to send messages we
-                 can forward *)
-              Log.err (fun f -> f
-                          "Sending icmp-dst-unreachable in response to UDP %s:%d -> %s:%d with DNF set IPv4 len %d"
-                           (Ipaddr.V4.to_string src) src_port
-                           (Ipaddr.V4.to_string dst) dst_port
-                           length);
-              Stack_ipv4.writev t.ipv4 ethernet_ip_hdr [ reply ];
-            end else begin
+
             (*
               let payload = Cstruct.sub udp Wire_structs.sizeof_udp (length - Wire_structs.sizeof_udp) in
               let for_primary_ip = Ipaddr.V4.compare dst local_ip = 0 in
@@ -329,15 +210,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                 ) ((0, primary_udp), 0) ((local_ip, primary_udp) :: ips_to_udp) in
                 Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
               end else if (not for_us) then begin
-                (* For any other IP, NAT as usual *)
-                Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
-                             (Ipaddr.V4.to_string src) src_port
-                             (Ipaddr.V4.to_string dst) dst_port
-                             length
-                         );
-                let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.udp4 [ buf ] in
-                Socket.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 dst, dst_port) ~payload ()
-              end
+                end
               else if for_us && dst_port = 123 then begin
                 (* port 123 is special -- proxy these requests to
                    our localhost address for the local OSX ntp
@@ -346,25 +219,105 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                 Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost dst_port);
                 let reply buf = Stack_udp.writev ~source_ip:local_ip ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.udp4 [ buf ] in
                 Socket.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, dst_port) ~payload ()
-              end else *)Lwt.return_unit
+              end else *)
 
-            end
-          | _ -> Lwt.return_unit
+    (** Handle IPv4 datagrams by proxying them to a remote system *)
+    let input_ipv4 t ipv4 = match ipv4 with
+      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn; raw; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
+
+        if Tcp.Id.Set.mem id t.pending then begin
+          Log.debug (fun f -> f "%s:%d: connection in progress, ignoring duplicate SYN" (Ipaddr.V4.to_string local_ip) local_port);
+          Lwt.return_unit
+        end else begin
+          t.pending <- Tcp.Id.Set.add id t.pending;
+          let reject_flow port =
+            Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
+            None in
+          Lwt.finalize
+            (fun () ->
+              ( if syn then begin
+                  Host.Sockets.Stream.Tcp.connect (local_ip, local_port)
+                  >>= function
+                  | `Error (`Msg m) ->
+                    Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string local_ip) local_port m);
+                    Lwt.return reject_flow
+                  | `Ok socket ->
+                    let t = { Tcp.Flow.id; socket = Some socket } in
+                    let listeners port =
+                      Log.debug (fun f -> f "finding listener for port %d" port);
+                      Some (fun flow -> callback t flow)  in
+                    Lwt.return listeners
+                end else begin
+                  (* SYNs are only processed via interception; by the time TCP
+                     packets for a flow arrive here the flow should be established *)
+                  Lwt.return reject_flow
+                end )
+              >>= fun listeners ->
+              Stack_tcp.input t.tcp4 ~listeners ~src:dest_ip ~dst:local_ip raw
+            ) (fun () ->
+              t.pending <- Tcp.Id.Set.remove id t.pending;
+              Lwt.return_unit;
+            )
+        end
+      | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
+        if Cstruct.len payload < len then begin
+          Log.err (fun f -> f "Dropping UDP %s:%d -> %s:%d reported len %d actual len %d"
+                       (Ipaddr.V4.to_string src) src_port
+                       (Ipaddr.V4.to_string dst) dst_port
+                       len (Cstruct.len payload));
+          Lwt.return_unit
+        end else if dnf && (Cstruct.len payload > mtu) then begin
+          let would_fragment ~ip_header ~ip_payload =
+            let open Wire_structs.Ipv4_wire in
+            let header = Cstruct.create sizeof_icmpv4 in
+            set_icmpv4_ty header 0x03;
+            set_icmpv4_code header 0x04;
+            set_icmpv4_csum header 0x0000;
+            (* this field is unused for icmp destination unreachable *)
+            set_icmpv4_id header 0x00;
+            set_icmpv4_seq header mtu;
+            let icmp_payload = match ip_payload with
+              | Some ip_payload ->
+                if (Cstruct.len ip_payload > 8) then begin
+                  let ip_payload = Cstruct.sub ip_payload 0 8 in
+                  Cstruct.append ip_header ip_payload
+                end else Cstruct.append ip_header ip_payload
+              | None -> ip_header
+            in
+            set_icmpv4_csum header
+              (Tcpip_checksum.ones_complement_list [ header;
+                                                     icmp_payload ]);
+            let icmp_packet = Cstruct.append header icmp_payload in
+            icmp_packet
+          in
+          let ethernet_frame, len = Stack_ipv4.allocate t.ipv4
+            ~src:dst ~dst:src ~proto:`ICMP in
+          let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
+
+          let reply = would_fragment
+              ~ip_header:(Cstruct.sub raw 0 (ihl * 4))
+              ~ip_payload:(Some (Cstruct.sub raw (ihl * 4) 8)) in
+          (* Rather than silently unset the do not fragment bit, we
+             respond with an ICMP error message which will
+             hopefully prompt the other side to send messages we
+             can forward *)
+          Log.err (fun f -> f
+                      "Sending icmp-dst-unreachable in response to UDP %s:%d -> %s:%d with DNF set IPv4 len %d"
+                       (Ipaddr.V4.to_string src) src_port
+                       (Ipaddr.V4.to_string dst) dst_port
+                       len);
+          Stack_ipv4.writev t.ipv4 ethernet_ip_hdr [ reply ];
+        end else begin
+          Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
+                       (Ipaddr.V4.to_string src) src_port
+                       (Ipaddr.V4.to_string dst) dst_port
+                       len
+                   );
+          let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.udp4 [ buf ] in
+          Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 dst, dst_port) ~payload ()
         end
       | _ -> Lwt.return_unit
-
-    (* Process a single ethernet frame *)
-    let input_ethernet_frame t buffer =
-      Stack_ethif.input
-        ~arpv4:(Stack_arpv4.input t.arp)
-        ~ipv4:(
-          Stack_ipv4.input
-            ~tcp:(tcp_input t)
-            ~udp:(fun ~src ~dst _buf -> udp_input t ~src ~dst buffer)
-            ~default:(fun ~proto:_ ~src:_ ~dst:_ _ -> Lwt.return_unit)
-            t.ipv4)
-        ~ipv6:(fun _ -> Lwt.return_unit)
-        t.ethif buffer
 
     let of_ip switch arp_table ip =
     (* FIXME: serialise this to prevent setting up the same stack in parallel *)
@@ -398,7 +351,13 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         all := IPMap.add ip tcp_stack !all;
 
         (* Wire up the listeners to receive future packets: *)
-        Switch.Port.listen netif (input_ethernet_frame tcp_stack)
+        Switch.Port.listen netif
+          (fun buf ->
+            let open Frame in
+            match parse buf with
+            | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
+            | _ -> Lwt.return_unit
+          )
         >>= fun () ->
 
         Lwt.return (`Ok tcp_stack)
@@ -442,21 +401,16 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
     (fun buf ->
       let open Frame in
       match parse buf with
-      | Ok (Ethernet { payload = Ipv4 { dst = 67; _ }; _ }) ->
+      | Ok (Ethernet { payload = Ipv4 { payload = Udp { dst = 67; _ }; _ }; _ })
+      | Ok (Ethernet { payload = Ipv4 { payload = Udp { dst = 68; _ }; _ }; _ }) ->
         Dhcp.callback dhcp buf
-      | Ok (Ethernet { payload = Ipv4 { dst = 68; _ }; _ }) ->
-        Dhcp.callback dhcp buf
-        (*
       | Ok (Ethernet { payload = Arp { op = `Request }; _ }) ->
         Log.debug (fun f -> f "ARP REQUEST");
         (* Arp.input expects only the ARP packet, with no ethernet header prefix *)
         Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
-      | Ok (Ethernet { payload = Ipv4 { payload = Udp { payload = _ }; _ }; _})
-      | Ok (Ethernet { payload = Ipv4 { payload = Tcp { payload = _ }; _ }; _}) ->
-        (* For any new TCP packet, create a stack to proxy for the remote system *)
+      | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4 ); _ }) ->
+        (* For any new IP destination, create a stack to proxy for the remote system *)
         Log.debug (fun f -> f "TCP or UDP D3T3CT3D");
-        let ipv4       = Cstruct.shift         buf    14                         in
-        let dst        = Cstruct.BE.get_uint32 ipv4   16 |> Ipaddr.V4.of_int32   in
         begin Stack.of_ip switch arp_table dst
         >>= function
         | `Error (`Msg m) ->
@@ -464,9 +418,8 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
           Lwt.return_unit
         | `Ok tcp_stack ->
           (* inject the ethernet frame into the new stack *)
-          Stack.input_ethernet_frame tcp_stack buf
+          Stack.input_ipv4 tcp_stack (Ipv4 ipv4)
         end
-        *)
       | _ ->
         Cstruct.hexdump buf;
         Lwt.return_unit
