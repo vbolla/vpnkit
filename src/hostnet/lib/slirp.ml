@@ -156,17 +156,52 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     end
   end
 
-  module Stack = struct
+  module Endpoint = struct
 
     type t = {
+      netif:           Switch.Port.t;
       ethif:           Stack_ethif.t;
       arp:             Stack_arpv4.t;
       ipv4:            Stack_ipv4.t;
       udp4:            Stack_udp.t;
       tcp4:            Stack_tcp.t;
+    }
+    (** A generic TCP/IP endpoint *)
+
+    let create switch arp_table ip =
+      let netif = Switch.port switch ip in
+      let open Infix in
+      or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+      >>= fun ethif ->
+      or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+      >>= fun arp ->
+      or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+      >>= fun ipv4 ->
+      or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+      >>= fun udp4 ->
+      or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+      >>= fun tcp4 ->
+
+      let open Lwt.Infix in
+      Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
+      >>= fun () ->
+      Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
+      >>= fun () ->
+      Stack_ipv4.set_ip_gateways ipv4 [ ]
+      >>= fun () ->
+
+      let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4 } in
+      Lwt.return (`Ok tcp_stack)
+  end
+
+  module Remote = struct
+
+    type t = {
+      endpoint:        Endpoint.t;
       mutable pending: Tcp.Id.Set.t;
       mutable flows:   Tcp.Flow.t Tcp.Id.Map.t;
     }
+    (** Represents a remote system by proxying data to and from sockets *)
 
     let all : t IPMap.t ref = ref IPMap.empty
 
@@ -254,7 +289,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                   Lwt.return reject_flow
                 end )
               >>= fun listeners ->
-              Stack_tcp.input t.tcp4 ~listeners ~src:dest_ip ~dst:local_ip raw
+              Stack_tcp.input t.endpoint.Endpoint.tcp4 ~listeners ~src:dest_ip ~dst:local_ip raw
             ) (fun () ->
               t.pending <- Tcp.Id.Set.remove id t.pending;
               Lwt.return_unit;
@@ -291,7 +326,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             let icmp_packet = Cstruct.append header icmp_payload in
             icmp_packet
           in
-          let ethernet_frame, len = Stack_ipv4.allocate t.ipv4
+          let ethernet_frame, len = Stack_ipv4.allocate t.endpoint.Endpoint.ipv4
             ~src:dst ~dst:src ~proto:`ICMP in
           let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
 
@@ -307,14 +342,14 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                        (Ipaddr.V4.to_string src) src_port
                        (Ipaddr.V4.to_string dst) dst_port
                        len);
-          Stack_ipv4.writev t.ipv4 ethernet_ip_hdr [ reply ];
+          Stack_ipv4.writev t.endpoint.Endpoint.ipv4 ethernet_ip_hdr [ reply ];
         end else begin
           Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
                        (Ipaddr.V4.to_string src) src_port
                        (Ipaddr.V4.to_string dst) dst_port
                        len
                    );
-          let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.udp4 [ buf ] in
+          let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
           Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 dst, dst_port) ~payload ()
         end
       | _ -> Lwt.return_unit
@@ -324,34 +359,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       if IPMap.mem ip !all
       then Lwt.return (`Ok (IPMap.find ip !all))
       else begin
-        let netif = Switch.port switch ip in
         let open Infix in
-        or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
-        >>= fun ethif ->
-        or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
-        >>= fun arp ->
-        or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
-        >>= fun ipv4 ->
-        or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
-        >>= fun udp4 ->
-        or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
-        >>= fun tcp4 ->
-
-        let open Lwt.Infix in
-        Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
-        >>= fun () ->
-        Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
-        >>= fun () ->
-        Stack_ipv4.set_ip_gateways ipv4 [ ]
-        >>= fun () ->
+        Endpoint.create switch arp_table ip
+        >>= fun endpoint ->
 
         let pending = Tcp.Id.Set.empty in
         let flows = Tcp.Id.Map.empty in
-        let tcp_stack = { ethif; arp; ipv4; udp4; tcp4; pending; flows} in
+        let tcp_stack = { endpoint; pending; flows} in
         all := IPMap.add ip tcp_stack !all;
 
+        let open Lwt.Infix in
         (* Wire up the listeners to receive future packets: *)
-        Switch.Port.listen netif
+        Switch.Port.listen endpoint.Endpoint.netif
           (fun buf ->
             let open Frame in
             match parse buf with
@@ -411,14 +430,14 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
       | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4 ); _ }) ->
         (* For any new IP destination, create a stack to proxy for the remote system *)
         Log.debug (fun f -> f "TCP or UDP D3T3CT3D");
-        begin Stack.of_ip switch arp_table dst
+        begin Remote.of_ip switch arp_table dst
         >>= function
         | `Error (`Msg m) ->
           Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
           Lwt.return_unit
         | `Ok tcp_stack ->
           (* inject the ethernet frame into the new stack *)
-          Stack.input_ipv4 tcp_stack (Ipv4 ipv4)
+          Remote.input_ipv4 tcp_stack (Ipv4 ipv4)
         end
       | _ ->
         Cstruct.hexdump buf;
