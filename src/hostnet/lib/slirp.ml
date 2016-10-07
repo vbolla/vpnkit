@@ -165,6 +165,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       ipv4:            Stack_ipv4.t;
       udp4:            Stack_udp.t;
       tcp4:            Stack_tcp.t;
+      mutable pending: Tcp.Id.Set.t;
     }
     (** A generic TCP/IP endpoint *)
 
@@ -190,8 +191,61 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       Stack_ipv4.set_ip_gateways ipv4 [ ]
       >>= fun () ->
 
-      let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4 } in
+      let pending = Tcp.Id.Set.empty in
+
+      let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending } in
       Lwt.return (`Ok tcp_stack)
+
+    let callback t tcpv4 = match t.Tcp.Flow.socket with
+      | None ->
+        Log.err (fun f -> f "%s callback called on closed socket" (Tcp.Flow.to_string t));
+        Lwt.return_unit
+      | Some socket ->
+        Lwt.finalize
+          (fun () ->
+            Mirage_flow.proxy (module Clock) (module Stack_tcp) tcpv4 (module Host.Sockets.Stream.Tcp) socket ()
+            >>= function
+            | `Error (`Msg m) ->
+              Log.err (fun f -> f "%s proxy failed with %s" (Tcp.Flow.to_string t) m);
+              Lwt.return_unit
+            | `Ok (_l_stats, _r_stats) ->
+              Lwt.return_unit
+          ) (fun () ->
+            t.Tcp.Flow.socket <- None;
+            Host.Sockets.Stream.Tcp.close socket
+            >>= fun () ->
+            Lwt.return_unit
+          )
+
+    let forward_tcp t id (ip, port) (syn: Cstruct.t) =
+      if Tcp.Id.Set.mem id t.pending then begin
+        Log.debug (fun f -> f "%s: connection in progress, ignoring duplicate SYN" (string_of_id id));
+        Lwt.return_unit
+      end else begin
+        t.pending <- Tcp.Id.Set.add id t.pending;
+        let reject_flow port =
+          Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
+          None in
+        Lwt.finalize
+          (fun () ->
+            ( Host.Sockets.Stream.Tcp.connect (ip, port)
+              >>= function
+              | `Error (`Msg m) ->
+                Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string ip) port m);
+                Lwt.return reject_flow
+              | `Ok socket ->
+                let t = { Tcp.Flow.id; socket = Some socket } in
+                let listeners port =
+                  Log.debug (fun f -> f "finding listener for port %d" port);
+                  Some (fun flow -> callback t flow)  in
+                Lwt.return listeners )
+            >>= fun listeners ->
+            Stack_tcp.input t.tcp4 ~listeners ~src:id.Stack_tcp_wire.dest_ip ~dst:ip syn
+          ) (fun () ->
+            t.pending <- Tcp.Id.Set.remove id t.pending;
+            Lwt.return_unit;
+          )
+      end
   end
 
   open Frame
@@ -202,14 +256,22 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     }
     (** Represents the local machine including NTP and DNS servers *)
 
+    (*
+    let (nth, udp), _ = List.fold_left (fun ((nth, udp), i) (x, udp') ->
+      (if Ipaddr.V4.compare dst x = 0 then (i, udp') else (nth, udp)), i + 1
+    ) ((0, primary_udp), 0) ((local_ip, primary_udp) :: ips_to_udp) in
+    *)
+
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 53; payload = Payload payload; _ }; _ } ->
         let nth = failwith "nth?" in
         let udp = t.endpoint.Endpoint.udp4 in
         Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
-      | Ipv4 { src = _; dst = _; payload = Tcp { src = _; dst = 53; payload = Payload _; _ }; _ } ->
-        failwith "TCP DNS"
+      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn = true; raw; payload = Payload _; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
+        let ip, port = failwith "choose_server" in
+        Endpoint.forward_tcp t.endpoint id (ip, port) raw
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 123; payload = Payload payload; _ }; _ } ->
         let localhost = Ipaddr.V4.localhost in
         Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost 123);
@@ -244,102 +306,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     type t = {
       endpoint:        Endpoint.t;
-      mutable pending: Tcp.Id.Set.t;
       mutable flows:   Tcp.Flow.t Tcp.Id.Map.t;
     }
     (** Represents a remote system by proxying data to and from sockets *)
 
     let all : t IPMap.t ref = ref IPMap.empty
 
-    let callback t tcpv4 = match t.Tcp.Flow.socket with
-      | None ->
-        Log.err (fun f -> f "%s callback called on closed socket" (Tcp.Flow.to_string t));
-        Lwt.return_unit
-      | Some socket ->
-        Lwt.finalize
-          (fun () ->
-            Mirage_flow.proxy (module Clock) (module Stack_tcp) tcpv4 (module Host.Sockets.Stream.Tcp) socket ()
-            >>= function
-            | `Error (`Msg m) ->
-              Log.err (fun f -> f "%s proxy failed with %s" (Tcp.Flow.to_string t) m);
-              Lwt.return_unit
-            | `Ok (_l_stats, _r_stats) ->
-              Lwt.return_unit
-          ) (fun () ->
-            t.Tcp.Flow.socket <- None;
-            Host.Sockets.Stream.Tcp.close socket
-            >>= fun () ->
-            Lwt.return_unit
-          )
-
-
-
-
-            (*
-              let payload = Cstruct.sub udp Wire_structs.sizeof_udp (length - Wire_structs.sizeof_udp) in
-              let for_primary_ip = Ipaddr.V4.compare dst local_ip = 0 in
-              let for_extra_dns = List.fold_left (||) false (List.map (fun ip -> Ipaddr.V4.compare dst ip = 0) extra_dns_ip) in
-              let for_us = for_primary_ip || for_extra_dns in
-              if for_us && dst_port = 53 then begin
-                let primary_udp = Tcpip_stack.udpv4 s in
-                (* We need to find the corresponding `udp` value so we can send
-                   data with the correct source IP, and the `nth` value so we can
-                   map to the correct destination server. *)
-                let (nth, udp), _ = List.fold_left (fun ((nth, udp), i) (x, udp') ->
-                  (if Ipaddr.V4.compare dst x = 0 then (i, udp') else (nth, udp)), i + 1
-                ) ((0, primary_udp), 0) ((local_ip, primary_udp) :: ips_to_udp) in
-                Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
-              end else if (not for_us) then begin
-                end
-              else if for_us && dst_port = 123 then begin
-                (* port 123 is special -- proxy these requests to
-                   our localhost address for the local OSX ntp
-                   listener to respond to *)
-                let localhost = Ipaddr.V4.localhost in
-                Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost dst_port);
-                let reply buf = Stack_udp.writev ~source_ip:local_ip ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.udp4 [ buf ] in
-                Socket.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, dst_port) ~payload ()
-              end else *)
-
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
-      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn; raw; _ }; _ } ->
+      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = true; raw; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
-
-        if Tcp.Id.Set.mem id t.pending then begin
-          Log.debug (fun f -> f "%s:%d: connection in progress, ignoring duplicate SYN" (Ipaddr.V4.to_string local_ip) local_port);
-          Lwt.return_unit
-        end else begin
-          t.pending <- Tcp.Id.Set.add id t.pending;
-          let reject_flow port =
-            Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
-            None in
-          Lwt.finalize
-            (fun () ->
-              ( if syn then begin
-                  Host.Sockets.Stream.Tcp.connect (local_ip, local_port)
-                  >>= function
-                  | `Error (`Msg m) ->
-                    Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string local_ip) local_port m);
-                    Lwt.return reject_flow
-                  | `Ok socket ->
-                    let t = { Tcp.Flow.id; socket = Some socket } in
-                    let listeners port =
-                      Log.debug (fun f -> f "finding listener for port %d" port);
-                      Some (fun flow -> callback t flow)  in
-                    Lwt.return listeners
-                end else begin
-                  (* SYNs are only processed via interception; by the time TCP
-                     packets for a flow arrive here the flow should be established *)
-                  Lwt.return reject_flow
-                end )
-              >>= fun listeners ->
-              Stack_tcp.input t.endpoint.Endpoint.tcp4 ~listeners ~src:dest_ip ~dst:local_ip raw
-            ) (fun () ->
-              t.pending <- Tcp.Id.Set.remove id t.pending;
-              Lwt.return_unit;
-            )
-        end
+        Endpoint.forward_tcp t.endpoint id (local_ip, local_port) raw
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         if Cstruct.len payload < len then begin
           Log.err (fun f -> f "Dropping UDP %s:%d -> %s:%d reported len %d actual len %d"
@@ -408,9 +385,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         Endpoint.create switch arp_table ip
         >>= fun endpoint ->
 
-        let pending = Tcp.Id.Set.empty in
         let flows = Tcp.Id.Map.empty in
-        let tcp_stack = { endpoint; pending; flows} in
+        let tcp_stack = { endpoint; flows} in
         all := IPMap.add ip tcp_stack !all;
 
         let open Lwt.Infix in
@@ -502,75 +478,12 @@ let connect x peer_ip local_ip extra_dns_ip get_domain_search =
         Lwt.return_unit
     )
   >>= fun () ->
-(*
-  let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search in
-        begin Tcpip_stack.connect ~config x
-        >>= function
-        | `Error (`Msg m) -> failwith m
-        | `Ok (s, udps, capture) ->
-            let ips_to_udp = List.combine extra_dns_ip udps in
-            Vmnet.add_listener x (
-              fun buf ->
 
-                | _ -> Lwt.return_unit
-            );
-            Tcpip_stack.listen_tcpv4_flow s ~on_flow_arrival:(
-              fun ~src:(src_ip, src_port) ~dst:(dst_ip, dst_port) ->
-                let for_us dst_ip = Ipaddr.V4.compare dst_ip local_ip = 0 in
-                let for_extra_dns = List.fold_left (||) false (List.map (fun ip -> Ipaddr.V4.compare dst_ip ip = 0) extra_dns_ip) in
-                let for_dns dst_ip = for_us dst_ip || for_extra_dns in
-                ( if for_dns dst_ip && dst_port = 53 then begin
-                    Resolv_conf.get ()
-                    >>= fun all ->
-                    let nth, _ = List.fold_left (fun (nth, i) x ->
-                      (if Ipaddr.V4.compare dst_ip x = 0 then i else nth), i + 1
-                    ) (0, 0) (local_ip :: extra_dns_ip) in
-                    match Dns_forward.choose_server ~nth all.Resolver.resolvers with
-                    | Some (description, (Ipaddr.V4 ip, port)) ->
-                      Lwt.return (":" ^ description, ip, port)
-                    | _ ->
-                      Log.err (fun f -> f "Failed to discover DNS server: assuming 127.0.01");
-                      Lwt.return (":no DNS server", Ipaddr.V4.of_string_exn "127.0.0.1", 53)
-                  end else Lwt.return ("", dst_ip, dst_port)
-                ) >>= fun (description, dst_ip, dst_port) ->
-                (* If the traffic is for us, use a local IP address that is really
-                   ours, rather than send traffic off to someone else (!) *)
-                let dst_ip = if for_us dst_ip then Ipaddr.V4.localhost else dst_ip in
-                Socket.Stream.Tcp.connect (dst_ip, dst_port)
-                >>= function
-                | `Error (`Msg _) ->
-                  return `Reject
-                | `Ok remote ->
-                  Lwt.return (`Accept (fun local ->
-                      finally (fun () ->
-                          (* proxy between local and remote *)
-                          Mirage_flow.proxy (module Clock) (module Tcpip_stack.TCPV4_half_close) local (module Socket.Stream.Tcp) remote ()
-                          >>= function
-                          | `Error (`Msg m) ->
-                            Log.err (fun f ->
-                              let description =
-                                Printf.sprintf "TCP%s %s:%d > %s:%d" description
-                                  (Ipaddr.V4.to_string src_ip) src_port
-                                  (Ipaddr.V4.to_string dst_ip) dst_port in
-                               f "%s proxy failed with %s" description m);
-                            return ()
-                          | `Ok (_l_stats, _r_stats) ->
-                            return ()
-                        ) (fun () ->
-                          Socket.Stream.Tcp.close remote
-                          >>= fun () ->
-                          Lwt.return ()
-                        )
-                    ))
-            );
-            Tcpip_stack.listen s
-            >>= fun () ->
-            *)
-            Log.info (fun f -> f "TCP/IP ready");
-            Lwt.return {
-              after_disconnect = Vmnet.after_disconnect x;
-              interface
-            }
+  Log.info (fun f -> f "TCP/IP ready");
+  Lwt.return {
+    after_disconnect = Vmnet.after_disconnect x;
+    interface
+  }
 
   let create config =
     let driver = [ "com.docker.driver.amd64-linux" ] in
