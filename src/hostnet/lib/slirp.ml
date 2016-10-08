@@ -192,6 +192,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let all : t IPMap.t ref = ref IPMap.empty
     let all_m = Lwt_mutex.create ()
 
+    let filesystem =
+      Vfs.Dir.of_list
+        (fun () ->
+          Vfs.ok (
+            IPMap.fold
+              (fun ip t acc ->
+                let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.last_active_time in
+                 Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
+              !all []
+          )
+        )
+
     let touch ip =
       if IPMap.mem ip !all
       then (IPMap.find ip !all).last_active_time <- Unix.gettimeofday ()
@@ -484,6 +496,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
            Vfs.Inode.dir "connections" Host.Sockets.connections;
            Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
            Vfs.Inode.dir "flows" Tcp.Flow.filesystem;
+           Vfs.Inode.dir "endpoints" Endpoint.filesystem;
          ]
       )
 
