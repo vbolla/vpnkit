@@ -189,32 +189,43 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     }
     (** A generic TCP/IP endpoint *)
 
+    let all : t IPMap.t ref = ref IPMap.empty
+    let all_m = Lwt_mutex.create ()
+
     let create switch arp_table ip =
-      let netif = Switch.port switch ip in
-      let open Infix in
-      or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
-      >>= fun ethif ->
-      or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
-      >>= fun arp ->
-      or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
-      >>= fun ipv4 ->
-      or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
-      >>= fun udp4 ->
-      or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
-      >>= fun tcp4 ->
+      Lwt_mutex.with_lock all_m
+        (fun () ->
+          if IPMap.mem ip !all
+          then Lwt.return (`Ok (IPMap.find ip !all))
+          else begin
+            let netif = Switch.port switch ip in
+            let open Infix in
+            or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+            >>= fun ethif ->
+            or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+            >>= fun arp ->
+            or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+            >>= fun ipv4 ->
+            or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+            >>= fun udp4 ->
+            or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+            >>= fun tcp4 ->
 
-      let open Lwt.Infix in
-      Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
-      >>= fun () ->
-      Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
-      >>= fun () ->
-      Stack_ipv4.set_ip_gateways ipv4 [ ]
-      >>= fun () ->
+            let open Lwt.Infix in
+            Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
+            >>= fun () ->
+            Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
+            >>= fun () ->
+            Stack_ipv4.set_ip_gateways ipv4 [ ]
+            >>= fun () ->
 
-      let pending = Tcp.Id.Set.empty in
+            let pending = Tcp.Id.Set.empty in
 
-      let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending } in
-      Lwt.return (`Ok tcp_stack)
+            let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending } in
+            all := IPMap.add ip tcp_stack !all;
+            Lwt.return (`Ok tcp_stack)
+          end
+        )
 
     let callback t tcpv4 = match t.Tcp.Flow.socket with
       | None ->
@@ -412,9 +423,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     }
     (** Represents a remote system by proxying data to and from sockets *)
 
-    let all : t IPMap.t ref = ref IPMap.empty
-    let all_m = Lwt_mutex.create ()
-
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
       | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = true; raw; _ }; _ } ->
@@ -439,33 +447,24 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       | _ -> Lwt.return_unit
 
     let of_ip switch arp_table ip =
-      (* avoid setting up the same stack twice at the same time *)
-      Lwt_mutex.with_lock all_m
-        (fun () ->
-          if IPMap.mem ip !all
-          then Lwt.return (`Ok (IPMap.find ip !all))
-          else begin
-            let open Infix in
-            Endpoint.create switch arp_table ip
-            >>= fun endpoint ->
+      let open Infix in
+      Endpoint.create switch arp_table ip
+      >>= fun endpoint ->
 
-            let tcp_stack = { endpoint } in
-            all := IPMap.add ip tcp_stack !all;
+      let tcp_stack = { endpoint } in
 
-            let open Lwt.Infix in
-            (* Wire up the listeners to receive future packets: *)
-            Switch.Port.listen endpoint.Endpoint.netif
-              (fun buf ->
-                 let open Frame in
-                 match parse buf with
-                 | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
-                 | _ -> Lwt.return_unit
-              )
-            >>= fun () ->
-
-            Lwt.return (`Ok tcp_stack)
-          end
+      let open Lwt.Infix in
+      (* Wire up the listeners to receive future packets: *)
+      Switch.Port.listen endpoint.Endpoint.netif
+        (fun buf ->
+           let open Frame in
+           match parse buf with
+           | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
+           | _ -> Lwt.return_unit
         )
+      >>= fun () ->
+
+      Lwt.return (`Ok tcp_stack)
   end
 
   let filesystem t =
