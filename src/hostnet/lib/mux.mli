@@ -1,4 +1,4 @@
-module Make(Netif: V1_LWT.NETWORK) : sig
+module Make(Netif: V1_LWT.NETWORK)(Time: V1_LWT.TIME) : sig
   include V1_LWT.NETWORK
 
   (** A simple ethernet multiplexer/demultiplexer

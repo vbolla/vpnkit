@@ -40,7 +40,7 @@ module ObviouslyCommon = struct
   type id = unit
 end
 
-module Make(Netif: V1_LWT.NETWORK) = struct
+module Make(Netif: V1_LWT.NETWORK)(Time: V1_LWT.TIME) = struct
   include DontCareAboutStats
   include ObviouslyCommon
 
@@ -73,6 +73,18 @@ module Make(Netif: V1_LWT.NETWORK) = struct
         )
       )
 
+  (* If no traffic is received for 5 minutes, delete the switch port. *)
+  let rec delete_unused_ports t () =
+    Time.sleep 30.
+    >>= fun () ->
+    let now = Unix.gettimeofday () in
+    let old_ips = RuleMap.fold (fun ip port acc ->
+        let age = now -. port.last_active_time in
+        if age > 300.0 then ip :: acc else acc
+      ) t.rules [] in
+    List.iter (fun ip -> t.rules <- RuleMap.remove ip t.rules) old_ips;
+    delete_unused_ports t ()
+
   let callback t buf =
     (* Does the packet match any of our rules? *)
     match Wire_structs.parse_ethernet_frame buf with
@@ -94,8 +106,9 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     let rules = RuleMap.empty in
     let default_callback = fun _ -> Lwt.return_unit in
     let t = { netif; rules; default_callback } in
-    Netif.listen netif (callback t)
+    Netif.listen netif @@ callback t
     >>= fun () ->
+    Lwt.async @@ delete_unused_ports t;
     Lwt.return t
 
   let write t buffer =

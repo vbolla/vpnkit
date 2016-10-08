@@ -66,7 +66,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Filteredif = Filter.Make(Vmnet)
   module Netif = Capture.Make(Filteredif)
-  module Switch = Mux.Make(Netif)
+  module Switch = Mux.Make(Netif)(Host.Time)
   module Dhcp = Dhcp.Make(Switch)
 
   (* This ARP implementation will respond to the VM: *)
@@ -533,18 +533,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     >>= fun arp ->
 
     (* Listen on local IPs *)
-    let dns_ips = local_ip :: extra_dns_ip in
-    Lwt_list.iter_s
-      (fun ip ->
-         Local.create switch arp_table dns_ips ip
-         >>= function
-         | `Error (`Msg m) ->
-           Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
-           Lwt.return_unit
-         | `Ok _ ->
-           Lwt.return_unit
-      ) dns_ips
-    >>= fun () ->
+    let local_ips = local_ip :: extra_dns_ip in
 
     let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
 
@@ -563,7 +552,16 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
          | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4 ); _ }) ->
            (* For any new IP destination, create a stack to proxy for the remote system *)
            Log.debug (fun f -> f "TCP or UDP D3T3CT3D");
-           begin Remote.of_ip switch arp_table dst
+           if List.mem dst local_ips then begin
+             Local.create switch arp_table local_ips dst
+             >>= function
+             | `Error (`Msg m) ->
+               Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
+               Lwt.return_unit
+             | `Ok tcp_stack ->
+               (* inject the ethernet frame into the new stack *)
+               Local.input_ipv4 tcp_stack (Ipv4 ipv4)
+           end else begin Remote.of_ip switch arp_table dst
              >>= function
              | `Error (`Msg m) ->
                Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
