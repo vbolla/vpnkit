@@ -147,13 +147,30 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       type t = {
         id: Stack_tcp_wire.id;
         mutable socket: Host.Sockets.Stream.Tcp.flow option;
+        mutable last_active_time: float;
       }
 
       let to_string t =
         Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
 
+      (* Global table of active flows *)
+      let all : t Id.Map.t ref = ref Id.Map.empty
+
+      let create id socket =
+        let socket = Some socket in
+        let last_active_time = Unix.gettimeofday () in
+        let t = { id; socket; last_active_time } in
+        all := Id.Map.add id t !all;
+        t
+      let remove id =
+        all := Id.Map.remove id !all
+      let touch id =
+        if Id.Map.mem id !all
+        then (Id.Map.find id !all).last_active_time <- Unix.gettimeofday ()
+        else Log.err (fun f -> f "flow %s is not registered" (string_of_id id))
     end
   end
+
 
   module Endpoint = struct
 
@@ -210,7 +227,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
              | `Ok (_l_stats, _r_stats) ->
                Lwt.return_unit
           ) (fun () ->
+              Log.debug (fun f -> f "closing flow %s" (string_of_id t.Tcp.Flow.id));
               t.Tcp.Flow.socket <- None;
+              Tcp.Flow.remove t.Tcp.Flow.id;
               Host.Sockets.Stream.Tcp.close socket
               >>= fun () ->
               Lwt.return_unit
@@ -233,7 +252,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                  Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string ip) port m);
                  Lwt.return reject_flow
                | `Ok socket ->
-                 let t = { Tcp.Flow.id; socket = Some socket } in
+                 let t = Tcp.Flow.create id socket in
                  let listeners port =
                    Log.debug (fun f -> f "finding listener for port %d" port);
                    Some (fun flow -> callback t flow)  in
@@ -318,6 +337,10 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
           Lwt.return_unit
         end
+      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = false; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
+        Tcp.Flow.touch id;
+        Lwt.return_unit
       | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn = true; raw; payload = Payload _; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
         begin match index Ipaddr.V4.compare t.dns_ips dst with
@@ -382,7 +405,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     type t = {
       endpoint:        Endpoint.t;
-      mutable flows:   Tcp.Flow.t Tcp.Id.Map.t;
     }
     (** Represents a remote system by proxying data to and from sockets *)
 
@@ -393,6 +415,10 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = true; raw; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
         Endpoint.forward_tcp t.endpoint id (local_ip, local_port) raw
+      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = false; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
+        Tcp.Flow.touch id;
+        Lwt.return_unit
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
           (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
@@ -416,8 +442,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         Endpoint.create switch arp_table ip
         >>= fun endpoint ->
 
-        let flows = Tcp.Id.Map.empty in
-        let tcp_stack = { endpoint; flows} in
+        let tcp_stack = { endpoint } in
         all := IPMap.add ip tcp_stack !all;
 
         let open Lwt.Infix in
