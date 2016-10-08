@@ -253,6 +253,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   module Local = struct
     type t = {
       endpoint: Endpoint.t;
+      dns_ips: Ipaddr.V4.t list;
     }
     (** Represents the local machine including NTP and DNS servers *)
 
@@ -261,17 +262,38 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       (if Ipaddr.V4.compare dst x = 0 then (i, udp') else (nth, udp)), i + 1
     ) ((0, primary_udp), 0) ((local_ip, primary_udp) :: ips_to_udp) in
     *)
+    let index compare =
+      let rec loop i xs y = match xs with
+        | [] -> None
+        | x :: xs -> if compare x y = 0 then Some i else loop (i + 1) xs y in
+      loop 0
 
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 53; payload = Payload payload; _ }; _ } ->
-        let nth = failwith "nth?" in
-        let udp = t.endpoint.Endpoint.udp4 in
-        Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
+        begin match index Ipaddr.V4.compare t.dns_ips dst with
+        | Some nth ->
+          let udp = t.endpoint.Endpoint.udp4 in
+          Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
+        | None ->
+          Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
+          Lwt.return_unit
+        end
       | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn = true; raw; payload = Payload _; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
-        let ip, port = failwith "choose_server" in
-        Endpoint.forward_tcp t.endpoint id (ip, port) raw
+        begin match index Ipaddr.V4.compare t.dns_ips dst with
+        | Some nth ->
+          begin Dns_forwarder.choose_server ~nth () >>= function
+            | Some (_, (Ipaddr.V4 ip, port)) ->
+              Endpoint.forward_tcp t.endpoint id (ip, port) raw
+            | _ ->
+              (* no IPv4 servers configured *)
+              Lwt.return_unit
+          end
+        | None ->
+          Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
+          Lwt.return_unit
+        end
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 123; payload = Payload payload; _ }; _ } ->
         let localhost = Ipaddr.V4.localhost in
         Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost 123);
@@ -280,12 +302,12 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       | _ ->
         failwith "other local traffic"
 
-    let create switch arp_table ip =
+    let create switch arp_table dns_ips ip =
       let open Infix in
       Endpoint.create switch arp_table ip
       >>= fun endpoint ->
 
-      let tcp_stack = { endpoint } in
+      let tcp_stack = { endpoint; dns_ips } in
 
       let open Lwt.Infix in
       (* Wire up the listeners to receive future packets: *)
@@ -435,16 +457,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     >>= fun arp ->
 
     (* Listen on local IPs *)
+    let dns_ips = local_ip :: extra_dns_ip in
     Lwt_list.iter_s
       (fun ip ->
-         Local.create switch arp_table ip
+         Local.create switch arp_table dns_ips ip
          >>= function
          | `Error (`Msg m) ->
            Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
            Lwt.return_unit
          | `Ok _ ->
            Lwt.return_unit
-      ) (local_ip :: extra_dns_ip)
+      ) dns_ips
     >>= fun () ->
 
     let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
