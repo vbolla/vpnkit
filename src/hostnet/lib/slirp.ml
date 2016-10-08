@@ -8,7 +8,6 @@ let src =
 module Log = (val Logs.src_log src : Logs.LOG)
 
 module IPMap = Map.Make(Ipaddr.V4)
-module IntMap = Map.Make(struct type t = int let compare (a:int) (b:int) = compare a b end)
 
 let client_macaddr = Macaddr.of_string_exn "C0:FF:EE:C0:FF:EE"
 (* random MAC from https://www.hellion.org.uk/cgi-bin/randmac.pl *)
@@ -695,10 +694,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     Lwt.return t
 
   let connect t client =
-    Vmnet.of_fd ~client_macaddr ~server_macaddr client
-    >>= function
-    | `Error (`Msg m) -> failwith m
-    | `Ok x ->
+    or_failwith "vmnet" @@ Vmnet.of_fd ~client_macaddr ~server_macaddr client
+    >>= fun x ->
       Log.debug (fun f -> f "accepted vmnet connection");
 
       let rec monitor_pcap_settings pcap_settings =
