@@ -246,6 +246,51 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
               Lwt.return_unit;
             )
       end
+
+    (* Send an ICMP destination reachable message in response to the given
+       packet. This can be used to indicate the packet would have been fragmented
+       when the do-not-fragment flag is set. *)
+    let send_icmp_dst_unreachable t ~src ~dst ~src_port ~dst_port ~ihl raw =
+      let would_fragment ~ip_header ~ip_payload =
+        let open Wire_structs.Ipv4_wire in
+        let header = Cstruct.create sizeof_icmpv4 in
+        set_icmpv4_ty header 0x03;
+        set_icmpv4_code header 0x04;
+        set_icmpv4_csum header 0x0000;
+        (* this field is unused for icmp destination unreachable *)
+        set_icmpv4_id header 0x00;
+        set_icmpv4_seq header mtu;
+        let icmp_payload = match ip_payload with
+          | Some ip_payload ->
+            if (Cstruct.len ip_payload > 8) then begin
+              let ip_payload = Cstruct.sub ip_payload 0 8 in
+              Cstruct.append ip_header ip_payload
+            end else Cstruct.append ip_header ip_payload
+          | None -> ip_header
+        in
+        set_icmpv4_csum header
+          (Tcpip_checksum.ones_complement_list [ header;
+                                                 icmp_payload ]);
+        let icmp_packet = Cstruct.append header icmp_payload in
+        icmp_packet
+      in
+      let ethernet_frame, len = Stack_ipv4.allocate t.ipv4
+          ~src:dst ~dst:src ~proto:`ICMP in
+      let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
+
+      let reply = would_fragment
+          ~ip_header:(Cstruct.sub raw 0 (ihl * 4))
+          ~ip_payload:(Some (Cstruct.sub raw (ihl * 4) 8)) in
+      (* Rather than silently unset the do not fragment bit, we
+         respond with an ICMP error message which will
+         hopefully prompt the other side to send messages we
+         can forward *)
+      Log.err (fun f -> f
+                  "Sending icmp-dst-unreachable in response to UDP %s:%d -> %s:%d with DNF set IPv4 len %d"
+                  (Ipaddr.V4.to_string src) src_port
+                  (Ipaddr.V4.to_string dst) dst_port
+                  len);
+      Stack_ipv4.writev t.ipv4 ethernet_ip_hdr [ reply ];
   end
 
   open Frame
@@ -342,46 +387,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                       len (Cstruct.len payload));
           Lwt.return_unit
         end else if dnf && (Cstruct.len payload > mtu) then begin
-          let would_fragment ~ip_header ~ip_payload =
-            let open Wire_structs.Ipv4_wire in
-            let header = Cstruct.create sizeof_icmpv4 in
-            set_icmpv4_ty header 0x03;
-            set_icmpv4_code header 0x04;
-            set_icmpv4_csum header 0x0000;
-            (* this field is unused for icmp destination unreachable *)
-            set_icmpv4_id header 0x00;
-            set_icmpv4_seq header mtu;
-            let icmp_payload = match ip_payload with
-              | Some ip_payload ->
-                if (Cstruct.len ip_payload > 8) then begin
-                  let ip_payload = Cstruct.sub ip_payload 0 8 in
-                  Cstruct.append ip_header ip_payload
-                end else Cstruct.append ip_header ip_payload
-              | None -> ip_header
-            in
-            set_icmpv4_csum header
-              (Tcpip_checksum.ones_complement_list [ header;
-                                                     icmp_payload ]);
-            let icmp_packet = Cstruct.append header icmp_payload in
-            icmp_packet
-          in
-          let ethernet_frame, len = Stack_ipv4.allocate t.endpoint.Endpoint.ipv4
-              ~src:dst ~dst:src ~proto:`ICMP in
-          let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
-
-          let reply = would_fragment
-              ~ip_header:(Cstruct.sub raw 0 (ihl * 4))
-              ~ip_payload:(Some (Cstruct.sub raw (ihl * 4) 8)) in
-          (* Rather than silently unset the do not fragment bit, we
-             respond with an ICMP error message which will
-             hopefully prompt the other side to send messages we
-             can forward *)
-          Log.err (fun f -> f
-                      "Sending icmp-dst-unreachable in response to UDP %s:%d -> %s:%d with DNF set IPv4 len %d"
-                      (Ipaddr.V4.to_string src) src_port
-                      (Ipaddr.V4.to_string dst) dst_port
-                      len);
-          Stack_ipv4.writev t.endpoint.Endpoint.ipv4 ethernet_ip_hdr [ reply ];
+          Endpoint.send_icmp_dst_unreachable t.endpoint ~src ~dst ~src_port ~dst_port ~ihl raw
         end else begin
           Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
                         (Ipaddr.V4.to_string src) src_port
