@@ -339,6 +339,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost 123);
         let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:123 ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
         Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, 123) ~payload ()
+      | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
+        let description = Printf.sprintf "%s:%d -> %s:%d"
+          (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
+        if Cstruct.len payload < len then begin
+          Log.err (fun f -> f "%s: dropping because reported len %d actual len %d" description len (Cstruct.len payload));
+          Lwt.return_unit
+        end else if dnf && (Cstruct.len payload > mtu) then begin
+          Endpoint.send_icmp_dst_unreachable t.endpoint ~src ~dst ~src_port ~dst_port ~ihl raw
+        end else begin
+          let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
+          Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.(V4 V4.localhost), dst_port) ~payload ()
+        end
       | _ ->
         failwith "other local traffic"
 
@@ -380,20 +392,14 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
         Endpoint.forward_tcp t.endpoint id (local_ip, local_port) raw
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
+        let description = Printf.sprintf "%s:%d -> %s:%d"
+          (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
         if Cstruct.len payload < len then begin
-          Log.err (fun f -> f "Dropping UDP %s:%d -> %s:%d reported len %d actual len %d"
-                      (Ipaddr.V4.to_string src) src_port
-                      (Ipaddr.V4.to_string dst) dst_port
-                      len (Cstruct.len payload));
+          Log.err (fun f -> f "%s: dropping because reported len %d actual len %d" description len (Cstruct.len payload));
           Lwt.return_unit
         end else if dnf && (Cstruct.len payload > mtu) then begin
           Endpoint.send_icmp_dst_unreachable t.endpoint ~src ~dst ~src_port ~dst_port ~ihl raw
         end else begin
-          Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
-                        (Ipaddr.V4.to_string src) src_port
-                        (Ipaddr.V4.to_string dst) dst_port
-                        len
-                    );
           let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
           Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 dst, dst_port) ~payload ()
         end
