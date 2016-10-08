@@ -351,8 +351,11 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
           Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.(V4 V4.localhost), dst_port) ~payload ()
         end
+      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = dst_port; syn = true; raw; payload = Payload _; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
+        Endpoint.forward_tcp t.endpoint id (Ipaddr.V4.localhost, dst_port) raw
       | _ ->
-        failwith "other local traffic"
+        Lwt.return_unit
 
     let create switch arp_table dns_ips ip =
       let open Infix in
