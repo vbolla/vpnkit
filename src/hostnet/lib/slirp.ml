@@ -175,22 +175,27 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     end
   end
 
-
   module Endpoint = struct
 
     type t = {
-      netif:           Switch.Port.t;
-      ethif:           Stack_ethif.t;
-      arp:             Stack_arpv4.t;
-      ipv4:            Stack_ipv4.t;
-      udp4:            Stack_udp.t;
-      tcp4:            Stack_tcp.t;
-      mutable pending: Tcp.Id.Set.t;
+      netif:                    Switch.Port.t;
+      ethif:                    Stack_ethif.t;
+      arp:                      Stack_arpv4.t;
+      ipv4:                     Stack_ipv4.t;
+      udp4:                     Stack_udp.t;
+      tcp4:                     Stack_tcp.t;
+      mutable pending:          Tcp.Id.Set.t;
+      mutable last_active_time: float;
     }
     (** A generic TCP/IP endpoint *)
 
     let all : t IPMap.t ref = ref IPMap.empty
     let all_m = Lwt_mutex.create ()
+
+    let touch ip =
+      if IPMap.mem ip !all
+      then (IPMap.find ip !all).last_active_time <- Unix.gettimeofday ()
+      else Log.err (fun f -> f "IP %s is not registered" (Ipaddr.V4.to_string ip))
 
     let create switch arp_table ip =
       Lwt_mutex.with_lock all_m
@@ -220,8 +225,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
             >>= fun () ->
 
             let pending = Tcp.Id.Set.empty in
-
-            let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending } in
+            let last_active_time = Unix.gettimeofday () in
+            let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending; last_active_time } in
             all := IPMap.add ip tcp_stack !all;
             Lwt.return (`Ok tcp_stack)
           end
@@ -407,7 +412,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         (fun buf ->
            let open Frame in
            match parse buf with
-           | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
+           | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4); _ }) ->
+             Endpoint.touch dst;
+             input_ipv4 tcp_stack (Ipv4 ipv4)
            | _ -> Lwt.return_unit
         )
       >>= fun () ->
@@ -459,7 +466,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         (fun buf ->
            let open Frame in
            match parse buf with
-           | Ok (Ethernet { payload = Ipv4 ipv4; _ }) -> input_ipv4 tcp_stack (Ipv4 ipv4)
+           | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4); _ }) ->
+             Endpoint.touch dst;
+             input_ipv4 tcp_stack (Ipv4 ipv4)
            | _ -> Lwt.return_unit
         )
       >>= fun () ->
