@@ -257,11 +257,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     }
     (** Represents the local machine including NTP and DNS servers *)
 
-    (*
-    let (nth, udp), _ = List.fold_left (fun ((nth, udp), i) (x, udp') ->
-      (if Ipaddr.V4.compare dst x = 0 then (i, udp') else (nth, udp)), i + 1
-    ) ((0, primary_udp), 0) ((local_ip, primary_udp) :: ips_to_udp) in
-    *)
     let index compare =
       let rec loop i xs y = match xs with
         | [] -> None
