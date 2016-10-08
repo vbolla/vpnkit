@@ -98,15 +98,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   let after_disconnect t = t.after_disconnect
 
-  let filesystem t =
-    Vfs.Dir.of_list
-      (fun () ->
-         Vfs.ok [
-           Vfs.Inode.dir "connections" Host.Sockets.connections;
-           Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
-         ]
-      )
-
   let is_dns =
     let open Match in
     ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
@@ -151,10 +142,23 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       }
 
       let to_string t =
-        Printf.sprintf "%s socket = %s" (string_of_id t.id) (match t.socket with None -> "closed" | _ -> "open")
+        Printf.sprintf "%s socket = %s last_active_time = %.1f"
+          (string_of_id t.id)
+          (match t.socket with None -> "closed" | _ -> "open")
+          (Unix.gettimeofday ())
 
       (* Global table of active flows *)
       let all : t Id.Map.t ref = ref Id.Map.empty
+
+      let filesystem =
+        Vfs.Dir.of_list
+          (fun () ->
+            Vfs.ok (
+              Id.Map.fold
+                (fun _ t acc -> Vfs.Inode.dir (to_string t) Vfs.Dir.empty :: acc)
+                !all []
+            )
+          )
 
       let create id socket =
         let socket = Some socket in
@@ -459,6 +463,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         Lwt.return (`Ok tcp_stack)
       end
   end
+
+  let filesystem t =
+    Vfs.Dir.of_list
+      (fun () ->
+         Vfs.ok [
+           (* could replace "connections" with "flows" *)
+           Vfs.Inode.dir "connections" Host.Sockets.connections;
+           Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
+           Vfs.Inode.dir "flows" Tcp.Flow.filesystem;
+         ]
+      )
 
   let connect x peer_ip local_ip extra_dns_ip get_domain_search =
 
