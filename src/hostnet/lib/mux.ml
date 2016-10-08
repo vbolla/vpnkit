@@ -50,20 +50,39 @@ module Make(Netif: V1_LWT.NETWORK) = struct
 
   type callback = Cstruct.t -> unit Lwt.t
 
+  type port = {
+    callback: callback;
+    mutable last_active_time: float;
+  }
+
   type t = {
     netif: Netif.t;
-    mutable rules: callback RuleMap.t;
+    mutable rules: port RuleMap.t;
     mutable default_callback: callback;
   }
+
+  let filesystem t =
+    Vfs.Dir.of_list
+      (fun () ->
+        Vfs.ok (
+          RuleMap.fold
+            (fun ip t acc ->
+              let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.last_active_time in
+               Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
+            t.rules []
+        )
+      )
 
   let callback t buf =
     (* Does the packet match any of our rules? *)
     match Wire_structs.parse_ethernet_frame buf with
     | Some (Some Wire_structs.IPv4, _, payload) ->
       let dst = Wire_structs.Ipv4_wire.get_ipv4_dst payload |> Ipaddr.V4.of_int32 in
-      if RuleMap.mem dst t.rules
-      then RuleMap.find dst t.rules buf
-      else begin
+      if RuleMap.mem dst t.rules then begin
+        let port =  RuleMap.find dst t.rules in
+        port.last_active_time <- Unix.gettimeofday ();
+        port.callback buf
+      end else begin
         Log.debug (fun f -> f "using default callback for packet for %s" (Ipaddr.V4.to_string dst));
         t.default_callback buf
       end
@@ -95,7 +114,7 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     include DontCareAboutStats
     include ObviouslyCommon
 
-    type port = {
+    type _t = {
       switch: t;
       netif: Netif.t;
       rule: rule;
@@ -105,7 +124,9 @@ module Make(Netif: V1_LWT.NETWORK) = struct
     let writev t buffers = Netif.writev t.netif buffers
     let listen t callback =
       Log.debug (fun f -> f "activating switch port for %s" (Ipaddr.V4.to_string t.rule));
-      t.switch.rules <- RuleMap.add t.rule callback t.switch.rules;
+      let last_active_time = Unix.gettimeofday () in
+      let port = { callback; last_active_time } in
+      t.switch.rules <- RuleMap.add t.rule port t.switch.rules;
       Lwt.return_unit
     let disconnect t =
       Log.debug (fun f -> f "deactivating switch port for %s" (Ipaddr.V4.to_string t.rule));
@@ -114,7 +135,7 @@ module Make(Netif: V1_LWT.NETWORK) = struct
 
     let mac t = Netif.mac t.netif
 
-    type t = port
+    type t = _t
   end
 
   let port t rule = { Port.switch = t; netif = t.netif; rule }

@@ -94,6 +94,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   type t = {
     after_disconnect: unit Lwt.t;
     interface: Netif.t;
+    switch: Switch.t;
   }
 
   let after_disconnect t = t.after_disconnect
@@ -497,6 +498,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
            Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
            Vfs.Inode.dir "flows" Tcp.Flow.filesystem;
            Vfs.Inode.dir "endpoints" Endpoint.filesystem;
+           Vfs.Inode.dir "ports" @@ Switch.filesystem t.switch;
          ]
       )
 
@@ -579,7 +581,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     Log.info (fun f -> f "TCP/IP ready");
     Lwt.return {
       after_disconnect = Vmnet.after_disconnect x;
-      interface
+      interface;
+      switch
     }
 
   let create config =

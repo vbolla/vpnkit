@@ -28,4 +28,6 @@ module Make(Netif: V1_LWT.NETWORK) : sig
   (** Given a rule, create a network which will receive traffic matching the
       rule. *)
 
+  val filesystem: t -> Vfs.Dir.t
+  (** A virtual filesystem for debugging *)
 end
