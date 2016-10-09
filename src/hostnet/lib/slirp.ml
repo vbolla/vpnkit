@@ -154,11 +154,11 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       let filesystem =
         Vfs.Dir.of_list
           (fun () ->
-            Vfs.ok (
-              Id.Map.fold
-                (fun _ t acc -> Vfs.Inode.dir (to_string t) Vfs.Dir.empty :: acc)
-                !all []
-            )
+             Vfs.ok (
+               Id.Map.fold
+                 (fun _ t acc -> Vfs.Inode.dir (to_string t) Vfs.Dir.empty :: acc)
+                 !all []
+             )
           )
 
       let create id socket =
@@ -200,16 +200,16 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       >>= fun () ->
       Lwt_mutex.with_lock all_m
         (fun () ->
-          let now = Unix.gettimeofday () in
-          let old_ips = IPMap.fold (fun ip endpoint acc ->
-              let age = now -. endpoint.last_active_time in
-              if age > 300.0 then ip :: acc else acc
-            ) !all [] in
-          List.iter (fun ip ->
-            Switch.remove switch ip;
-            all := IPMap.remove ip !all
-          ) old_ips;
-          Lwt.return_unit
+           let now = Unix.gettimeofday () in
+           let old_ips = IPMap.fold (fun ip endpoint acc ->
+               let age = now -. endpoint.last_active_time in
+               if age > 300.0 then ip :: acc else acc
+             ) !all [] in
+           List.iter (fun ip ->
+               Switch.remove switch ip;
+               all := IPMap.remove ip !all
+             ) old_ips;
+           Lwt.return_unit
         )
       >>= fun () ->
       delete_unused_endpoints switch ()
@@ -217,13 +217,13 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let filesystem =
       Vfs.Dir.of_list
         (fun () ->
-          Vfs.ok (
-            IPMap.fold
-              (fun ip t acc ->
-                let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.last_active_time in
-                 Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
-              !all []
-          )
+           Vfs.ok (
+             IPMap.fold
+               (fun ip t acc ->
+                  let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.last_active_time in
+                  Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
+               !all []
+           )
         )
 
     let touch ip =
@@ -234,36 +234,36 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let create switch arp_table ip =
       Lwt_mutex.with_lock all_m
         (fun () ->
-          if IPMap.mem ip !all
-          then Lwt.return (`Ok (IPMap.find ip !all))
-          else begin
-            let netif = Switch.port switch ip in
-            let open Infix in
-            or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
-            >>= fun ethif ->
-            or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
-            >>= fun arp ->
-            or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
-            >>= fun ipv4 ->
-            or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
-            >>= fun udp4 ->
-            or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
-            >>= fun tcp4 ->
+           if IPMap.mem ip !all
+           then Lwt.return (`Ok (IPMap.find ip !all))
+           else begin
+             let netif = Switch.port switch ip in
+             let open Infix in
+             or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+             >>= fun ethif ->
+             or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+             >>= fun arp ->
+             or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+             >>= fun ipv4 ->
+             or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+             >>= fun udp4 ->
+             or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+             >>= fun tcp4 ->
 
-            let open Lwt.Infix in
-            Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
-            >>= fun () ->
-            Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
-            >>= fun () ->
-            Stack_ipv4.set_ip_gateways ipv4 [ ]
-            >>= fun () ->
+             let open Lwt.Infix in
+             Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
+             >>= fun () ->
+             Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
+             >>= fun () ->
+             Stack_ipv4.set_ip_gateways ipv4 [ ]
+             >>= fun () ->
 
-            let pending = Tcp.Id.Set.empty in
-            let last_active_time = Unix.gettimeofday () in
-            let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending; last_active_time } in
-            all := IPMap.add ip tcp_stack !all;
-            Lwt.return (`Ok tcp_stack)
-          end
+             let pending = Tcp.Id.Set.empty in
+             let last_active_time = Unix.gettimeofday () in
+             let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending; last_active_time } in
+             all := IPMap.add ip tcp_stack !all;
+             Lwt.return (`Ok tcp_stack)
+           end
         )
 
     let callback t tcpv4 = match t.Tcp.Flow.socket with
@@ -392,33 +392,33 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       (* UDP on port 53 -> DNS forwarder *)
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 53; payload = Payload payload; _ }; _ } ->
         begin match index Ipaddr.V4.compare t.dns_ips dst with
-        | Some nth ->
-          let udp = t.endpoint.Endpoint.udp4 in
-          Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
-        | None ->
-          Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
-          Lwt.return_unit
+          | Some nth ->
+            let udp = t.endpoint.Endpoint.udp4 in
+            Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
+          | None ->
+            Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
+            Lwt.return_unit
         end
       (* TCP to port 53 -> DNS forwarder *)
       | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn; raw; payload = Payload _; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
         begin match index Ipaddr.V4.compare t.dns_ips dst with
-        | Some nth ->
-          begin Dns_forwarder.choose_server ~nth () >>= function
-            | Some (_, (Ipaddr.V4 ip, port)) ->
-              if syn then begin
-                Endpoint.input_tcp_syn t.endpoint id (ip, port) raw
-              end else begin
-                Tcp.Flow.touch id;
-                Endpoint.input_tcp t.endpoint id ip raw
-              end
-            | _ ->
-              (* no IPv4 servers configured *)
-              Lwt.return_unit
-          end
-        | None ->
-          Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
-          Lwt.return_unit
+          | Some nth ->
+            begin Dns_forwarder.choose_server ~nth () >>= function
+              | Some (_, (Ipaddr.V4 ip, port)) ->
+                if syn then begin
+                  Endpoint.input_tcp_syn t.endpoint id (ip, port) raw
+                end else begin
+                  Tcp.Flow.touch id;
+                  Endpoint.input_tcp t.endpoint id ip raw
+                end
+              | _ ->
+                (* no IPv4 servers configured *)
+                Lwt.return_unit
+            end
+          | None ->
+            Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
+            Lwt.return_unit
         end
       (* UDP to port 123: localhost NTP *)
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 123; payload = Payload payload; _ }; _ } ->
@@ -429,7 +429,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       (* UDP to any other port: localhost *)
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
-          (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
+            (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
         if Cstruct.len payload < len then begin
           Log.err (fun f -> f "%s: dropping because reported len %d actual len %d" description len (Cstruct.len payload));
           Lwt.return_unit
@@ -494,7 +494,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         end
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
-          (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
+            (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
         if Cstruct.len payload < len then begin
           Log.err (fun f -> f "%s: dropping because reported len %d actual len %d" description len (Cstruct.len payload));
           Lwt.return_unit
@@ -804,25 +804,25 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   let connect t client =
     or_failwith "vmnet" @@ Vmnet.of_fd ~client_macaddr ~server_macaddr client
     >>= fun x ->
-      Log.debug (fun f -> f "accepted vmnet connection");
+    Log.debug (fun f -> f "accepted vmnet connection");
 
-      let rec monitor_pcap_settings pcap_settings =
-        ( match Active_config.hd pcap_settings with
-          | None ->
-            Log.debug (fun f -> f "Disabling any active packet capture");
-            Vmnet.stop_capture x
-          | Some (filename, size_limit) ->
-            Log.debug (fun f -> f "Capturing packets to %s %s" filename (match size_limit with None -> "with no limit" | Some x -> Printf.sprintf "limited to %Ld bytes" x));
-            Vmnet.start_capture x ?size_limit filename )
-        >>= fun () ->
-        Active_config.tl pcap_settings
-        >>= fun pcap_settings ->
-        monitor_pcap_settings pcap_settings in
-      Lwt.async (fun () ->
-          log_exception_continue "monitor_pcap_settings"
-            (fun () ->
-               monitor_pcap_settings t.pcap_settings
-            )
-        );
-      connect x t.peer_ip t.local_ip t.extra_dns_ip t.get_domain_search
+    let rec monitor_pcap_settings pcap_settings =
+      ( match Active_config.hd pcap_settings with
+        | None ->
+          Log.debug (fun f -> f "Disabling any active packet capture");
+          Vmnet.stop_capture x
+        | Some (filename, size_limit) ->
+          Log.debug (fun f -> f "Capturing packets to %s %s" filename (match size_limit with None -> "with no limit" | Some x -> Printf.sprintf "limited to %Ld bytes" x));
+          Vmnet.start_capture x ?size_limit filename )
+      >>= fun () ->
+      Active_config.tl pcap_settings
+      >>= fun pcap_settings ->
+      monitor_pcap_settings pcap_settings in
+    Lwt.async (fun () ->
+        log_exception_continue "monitor_pcap_settings"
+          (fun () ->
+             monitor_pcap_settings t.pcap_settings
+          )
+      );
+    connect x t.peer_ip t.local_ip t.extra_dns_ip t.get_domain_search
 end
