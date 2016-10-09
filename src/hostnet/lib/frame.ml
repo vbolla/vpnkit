@@ -50,6 +50,7 @@ let parse buf =
               let dst     = Cstruct.BE.get_uint16 inner 2 in
               let len     = Cstruct.BE.get_uint16 inner 4 in
               let payload = Cstruct.shift         inner 8 in
+              let len = len - 8 in (* subtract header length *)
               Ok (Udp { src; dst; len; payload = Payload payload })
             | _ ->
               Error (`Msg (Printf.sprintf "unknown IPv4 protocol type %d" proto)) )
