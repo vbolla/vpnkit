@@ -394,7 +394,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         begin match index Ipaddr.V4.compare t.dns_ips dst with
         | Some nth ->
           let udp = t.endpoint.Endpoint.udp4 in
-          Cstruct.hexdump payload;
           Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
         | None ->
           Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
@@ -589,13 +588,12 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
          | Ok (Ethernet { payload = Ipv4 { payload = Udp { dst = 68; _ }; _ }; _ }) ->
            Dhcp.callback dhcp buf
          | Ok (Ethernet { payload = Arp { op = `Request }; _ }) ->
-           Log.debug (fun f -> f "ARP REQUEST");
            (* Arp.input expects only the ARP packet, with no ethernet header prefix *)
            Global_arp.input arp (Cstruct.shift buf Wire_structs.sizeof_ethernet)
          | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4 ); _ }) ->
            (* For any new IP destination, create a stack to proxy for the remote system *)
-           Log.debug (fun f -> f "TCP or UDP D3T3CT3D");
            if List.mem dst local_ips then begin
+             Log.debug (fun f -> f "creating local TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
              Local.create switch arp_table local_ips dst
              >>= function
              | `Error (`Msg m) ->
@@ -604,7 +602,9 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
              | `Ok tcp_stack ->
                (* inject the ethernet frame into the new stack *)
                Local.input_ipv4 tcp_stack (Ipv4 ipv4)
-           end else begin Remote.of_ip switch arp_table dst
+           end else begin
+             Log.debug (fun f -> f "create remote TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
+             Remote.of_ip switch arp_table dst
              >>= function
              | `Error (`Msg m) ->
                Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
@@ -614,7 +614,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                Remote.input_ipv4 tcp_stack (Ipv4 ipv4)
            end
          | _ ->
-           Cstruct.hexdump buf;
            Lwt.return_unit
       )
     >>= fun () ->
