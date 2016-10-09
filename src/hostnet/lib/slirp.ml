@@ -268,22 +268,23 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
               Lwt.return_unit
             )
 
-    let forward_tcp t id (ip, port) (syn: Cstruct.t) =
+    let reject_new_flow port =
+      Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
+      None
+
+    let input_tcp_syn t id (ip, port) (syn: Cstruct.t) =
       if Tcp.Id.Set.mem id t.pending then begin
         Log.debug (fun f -> f "%s: connection in progress, ignoring duplicate SYN" (string_of_id id));
         Lwt.return_unit
       end else begin
         t.pending <- Tcp.Id.Set.add id t.pending;
-        let reject_flow port =
-          Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
-          None in
         Lwt.finalize
           (fun () ->
              ( Host.Sockets.Stream.Tcp.connect (ip, port)
                >>= function
                | `Error (`Msg m) ->
                  Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string ip) port m);
-                 Lwt.return reject_flow
+                 Lwt.return reject_new_flow
                | `Ok socket ->
                  let t = Tcp.Flow.create id socket in
                  let listeners port =
@@ -291,12 +292,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                    Some (fun flow -> callback t flow)  in
                  Lwt.return listeners )
              >>= fun listeners ->
+             Log.debug (fun f -> f "input_tcp_syn %s %s" (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) (Ipaddr.V4.to_string ip));
              Stack_tcp.input t.tcp4 ~listeners ~src:id.Stack_tcp_wire.dest_ip ~dst:ip syn
           ) (fun () ->
               t.pending <- Tcp.Id.Set.remove id t.pending;
               Lwt.return_unit;
             )
       end
+
+    let input_tcp t id dst buf =
+      Log.debug (fun f -> f "input_tcp %s %s" (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) (Ipaddr.V4.to_string dst));
+
+      Stack_tcp.input t.tcp4 ~listeners:reject_new_flow ~src:id.Stack_tcp_wire.dest_ip ~dst buf
 
     (* Send an ICMP destination reachable message in response to the given
        packet. This can be used to indicate the packet would have been fragmented
@@ -361,26 +368,30 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
+      (* UDP on port 53 -> DNS forwarder *)
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 53; payload = Payload payload; _ }; _ } ->
         begin match index Ipaddr.V4.compare t.dns_ips dst with
         | Some nth ->
           let udp = t.endpoint.Endpoint.udp4 in
+          Cstruct.hexdump payload;
           Dns_forwarder.input ~nth ~udp ~src ~dst ~src_port payload
         | None ->
           Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
           Lwt.return_unit
         end
-      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = false; _ }; _ } ->
-        let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
-        Tcp.Flow.touch id;
-        Lwt.return_unit
-      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn = true; raw; payload = Payload _; _ }; _ } ->
+      (* TCP to port 53 -> DNS forwarder *)
+      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = 53; syn; raw; payload = Payload _; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
         begin match index Ipaddr.V4.compare t.dns_ips dst with
         | Some nth ->
           begin Dns_forwarder.choose_server ~nth () >>= function
             | Some (_, (Ipaddr.V4 ip, port)) ->
-              Endpoint.forward_tcp t.endpoint id (ip, port) raw
+              if syn then begin
+                Endpoint.input_tcp_syn t.endpoint id (ip, port) raw
+              end else begin
+                Tcp.Flow.touch id;
+                Endpoint.input_tcp t.endpoint id ip raw
+              end
             | _ ->
               (* no IPv4 servers configured *)
               Lwt.return_unit
@@ -389,11 +400,13 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           Log.err (fun f -> f "DNS IP %s not recognised" (Ipaddr.V4.to_string dst));
           Lwt.return_unit
         end
+      (* UDP to port 123: localhost NTP *)
       | Ipv4 { src; dst; payload = Udp { src = src_port; dst = 123; payload = Payload payload; _ }; _ } ->
         let localhost = Ipaddr.V4.localhost in
         Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost 123);
         let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:123 ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
         Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, 123) ~payload ()
+      (* UDP to any other port: localhost *)
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
           (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
@@ -406,9 +419,15 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           let reply buf = Stack_udp.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port t.endpoint.Endpoint.udp4 [ buf ] in
           Host.Sockets.Datagram.input ~oneshot:false ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.(V4 V4.localhost), dst_port) ~payload ()
         end
-      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = dst_port; syn = true; raw; payload = Payload _; _ }; _ } ->
-        let id = { Stack_tcp_wire.local_port = 53; dest_ip = src; local_ip = dst; dest_port = src_port } in
-        Endpoint.forward_tcp t.endpoint id (Ipaddr.V4.localhost, dst_port) raw
+      (* TCP to local ports *)
+      | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = dst_port; syn; raw; payload = Payload _; _ }; _ } ->
+        let id = { Stack_tcp_wire.local_port = dst_port; dest_ip = src; local_ip = dst; dest_port = src_port } in
+        if syn then begin
+          Endpoint.input_tcp_syn t.endpoint id (Ipaddr.V4.localhost, dst_port) raw
+        end else begin
+          Tcp.Flow.touch id;
+          Endpoint.input_tcp t.endpoint id Ipaddr.V4.localhost raw
+        end
       | _ ->
         Lwt.return_unit
 
@@ -445,13 +464,14 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     (** Handle IPv4 datagrams by proxying them to a remote system *)
     let input_ipv4 t ipv4 = match ipv4 with
-      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = true; raw; _ }; _ } ->
+      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn; raw; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
-        Endpoint.forward_tcp t.endpoint id (local_ip, local_port) raw
-      | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn = false; _ }; _ } ->
-        let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
-        Tcp.Flow.touch id;
-        Lwt.return_unit
+        if syn then begin
+          Endpoint.input_tcp_syn t.endpoint id (local_ip, local_port) raw
+        end else begin
+          Tcp.Flow.touch id;
+          Endpoint.input_tcp t.endpoint id local_ip raw
+        end
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
           (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
