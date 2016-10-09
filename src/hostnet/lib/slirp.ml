@@ -91,14 +91,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Dns_forwarder = Dns_forward.Make(Stack_ipv4)(Stack_udp)(Resolv_conf)(Host.Sockets)(Host.Time)
 
-  type t = {
-    after_disconnect: unit Lwt.t;
-    interface: Netif.t;
-    switch: Switch.t;
-  }
-
-  let after_disconnect t = t.after_disconnect
-
   let is_dns =
     let open Match in
     ethernet @@ ipv4 () @@ ((udp ~src:53 () all) or (udp ~dst:53 () all) or ((tcp ~src:53 () all) or (tcp ~dst:53 () all)))
@@ -190,81 +182,35 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     }
     (** A generic TCP/IP endpoint *)
 
-    let all : t IPMap.t ref = ref IPMap.empty
-    let all_m = Lwt_mutex.create ()
-
-    (* If no traffic is received for 5 minutes, delete the endpoint and
-       the switch port. *)
-    let rec delete_unused_endpoints switch () =
-      Host.Time.sleep 30.
-      >>= fun () ->
-      Lwt_mutex.with_lock all_m
-        (fun () ->
-           let now = Unix.gettimeofday () in
-           let old_ips = IPMap.fold (fun ip endpoint acc ->
-               let age = now -. endpoint.last_active_time in
-               if age > 300.0 then ip :: acc else acc
-             ) !all [] in
-           List.iter (fun ip ->
-               Switch.remove switch ip;
-               all := IPMap.remove ip !all
-             ) old_ips;
-           Lwt.return_unit
-        )
-      >>= fun () ->
-      delete_unused_endpoints switch ()
-
-    let filesystem =
-      Vfs.Dir.of_list
-        (fun () ->
-           Vfs.ok (
-             IPMap.fold
-               (fun ip t acc ->
-                  let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.last_active_time in
-                  Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
-               !all []
-           )
-        )
-
-    let touch ip =
-      if IPMap.mem ip !all
-      then (IPMap.find ip !all).last_active_time <- Unix.gettimeofday ()
-      else Log.err (fun f -> f "IP %s is not registered" (Ipaddr.V4.to_string ip))
+    let touch t =
+      t.last_active_time <- Unix.gettimeofday ()
 
     let create switch arp_table ip =
-      Lwt_mutex.with_lock all_m
-        (fun () ->
-           if IPMap.mem ip !all
-           then Lwt.return (`Ok (IPMap.find ip !all))
-           else begin
-             let netif = Switch.port switch ip in
-             let open Infix in
-             or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
-             >>= fun ethif ->
-             or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
-             >>= fun arp ->
-             or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
-             >>= fun ipv4 ->
-             or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
-             >>= fun udp4 ->
-             or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
-             >>= fun tcp4 ->
+      let netif = Switch.port switch ip in
+      let open Infix in
+      or_error "Stack_ethif.connect" @@ Stack_ethif.connect netif
+      >>= fun ethif ->
+      or_error "Stack_arpv4.connect" @@ Stack_arpv4.connect ~table:arp_table ethif
+      >>= fun arp ->
+      or_error "Stack_ipv4.connect" @@ Stack_ipv4.connect ethif arp
+      >>= fun ipv4 ->
+      or_error "Stack_udp.connect" @@ Stack_udp.connect ipv4
+      >>= fun udp4 ->
+      or_error "Stack_tcp.connect" @@ Stack_tcp.connect ipv4
+      >>= fun tcp4 ->
 
-             let open Lwt.Infix in
-             Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
-             >>= fun () ->
-             Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
-             >>= fun () ->
-             Stack_ipv4.set_ip_gateways ipv4 [ ]
-             >>= fun () ->
+      let open Lwt.Infix in
+      Stack_ipv4.set_ip ipv4 ip (* I am the destination *)
+      >>= fun () ->
+      Stack_ipv4.set_ip_netmask ipv4 Ipaddr.V4.unspecified (* 0.0.0.0 *)
+      >>= fun () ->
+      Stack_ipv4.set_ip_gateways ipv4 [ ]
+      >>= fun () ->
 
-             let pending = Tcp.Id.Set.empty in
-             let last_active_time = Unix.gettimeofday () in
-             let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending; last_active_time } in
-             all := IPMap.add ip tcp_stack !all;
-             Lwt.return (`Ok tcp_stack)
-           end
-        )
+      let pending = Tcp.Id.Set.empty in
+      let last_active_time = Unix.gettimeofday () in
+      let tcp_stack = { netif; ethif; arp; ipv4; udp4; tcp4; pending; last_active_time } in
+      Lwt.return (`Ok tcp_stack)
 
     let callback t tcpv4 = match t.Tcp.Flow.socket with
       | None ->
@@ -373,6 +319,16 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       Stack_ipv4.writev t.ipv4 ethernet_ip_hdr [ reply ];
   end
 
+  type t = {
+    after_disconnect: unit Lwt.t;
+    interface: Netif.t;
+    switch: Switch.t;
+    mutable endpoints: Endpoint.t IPMap.t;
+    endpoints_m: Lwt_mutex.t;
+  }
+
+  let after_disconnect t = t.after_disconnect
+
   open Frame
 
   module Local = struct
@@ -442,21 +398,16 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       | _ ->
         Lwt.return_unit
 
-    let create switch arp_table dns_ips ip =
-      let open Infix in
-      Endpoint.create switch arp_table ip
-      >>= fun endpoint ->
-
+    let create endpoint dns_ips =
       let tcp_stack = { endpoint; dns_ips } in
-
       let open Lwt.Infix in
       (* Wire up the listeners to receive future packets: *)
       Switch.Port.listen endpoint.Endpoint.netif
         (fun buf ->
            let open Frame in
            match parse buf with
-           | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4); _ }) ->
-             Endpoint.touch dst;
+           | Ok (Ethernet { payload = Ipv4 ipv4; _ }) ->
+             Endpoint.touch endpoint;
              input_ipv4 tcp_stack (Ipv4 ipv4)
            | _ -> Lwt.return_unit
         )
@@ -505,8 +456,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         (fun buf ->
            let open Frame in
            match parse buf with
-           | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4); _ }) ->
-             Endpoint.touch dst;
+           | Ok (Ethernet { payload = Ipv4 ipv4; _ }) ->
+             Endpoint.touch endpoint;
              input_ipv4 tcp_stack (Ipv4 ipv4)
            | _ -> Lwt.return_unit
         )
@@ -516,6 +467,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
   end
 
   let filesystem t =
+    let endpoints =
+      Vfs.Dir.of_list
+        (fun () ->
+           Vfs.ok (
+             IPMap.fold
+               (fun ip t acc ->
+                  let txt = Printf.sprintf "%s last_active_time = %.1f" (Ipaddr.V4.to_string ip) t.Endpoint.last_active_time in
+                  Vfs.Inode.dir txt Vfs.Dir.empty :: acc)
+               t.endpoints []
+           )
+        ) in
     Vfs.Dir.of_list
       (fun () ->
          Vfs.ok [
@@ -523,10 +485,31 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
            Vfs.Inode.dir "connections" Host.Sockets.connections;
            Vfs.Inode.dir "capture" @@ Netif.filesystem t.interface;
            Vfs.Inode.dir "flows" Tcp.Flow.filesystem;
-           Vfs.Inode.dir "endpoints" Endpoint.filesystem;
+           Vfs.Inode.dir "endpoints" endpoints;
            Vfs.Inode.dir "ports" @@ Switch.filesystem t.switch;
          ]
       )
+
+  (* If no traffic is received for 5 minutes, delete the endpoint and
+     the switch port. *)
+  let rec delete_unused_endpoints t () =
+    Host.Time.sleep 30.
+    >>= fun () ->
+    Lwt_mutex.with_lock t.endpoints_m
+      (fun () ->
+         let now = Unix.gettimeofday () in
+         let old_ips = IPMap.fold (fun ip endpoint acc ->
+             let age = now -. endpoint.Endpoint.last_active_time in
+             if age > 300.0 then ip :: acc else acc
+           ) t.endpoints [] in
+         List.iter (fun ip ->
+             Switch.remove t.switch ip;
+             t.endpoints <- IPMap.remove ip t.endpoints
+           ) old_ips;
+         Lwt.return_unit
+      )
+    >>= fun () ->
+    delete_unused_endpoints t ()
 
   let connect x peer_ip local_ip extra_dns_ip get_domain_search =
 
@@ -548,8 +531,6 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     Switch.connect interface
     >>= fun switch ->
 
-    Lwt.async @@ Endpoint.delete_unused_endpoints switch;
-
     (* Serve a static ARP table *)
     let arp_table = [
       peer_ip, client_macaddr;
@@ -565,6 +546,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
 
+    let endpoints = IPMap.empty in
+    let endpoints_m = Lwt_mutex.create () in
+    let t = {
+      after_disconnect = Vmnet.after_disconnect x;
+      interface;
+      switch;
+      endpoints;
+      endpoints_m;
+    } in
+    Lwt.async @@ delete_unused_endpoints t;
+
     (* Add a listener which looks for new flows *)
     Switch.listen switch
       (fun buf ->
@@ -579,9 +571,23 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
          | Ok (Ethernet { payload = Ipv4 ({ dst; _ } as ipv4 ); _ }) ->
            (* For any new IP destination, create a stack to proxy for the remote system *)
            if List.mem dst local_ips then begin
-             Log.debug (fun f -> f "creating local TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
-             Local.create switch arp_table local_ips dst
-             >>= function
+             begin
+               let open Infix in
+               Lwt_mutex.with_lock t.endpoints_m
+                 (fun () ->
+                   if IPMap.mem dst t.endpoints
+                   then Lwt.return (`Ok (IPMap.find dst t.endpoints))
+                   else begin
+                     Endpoint.create switch arp_table dst
+                     >>= fun endpoint ->
+                     t.endpoints <- IPMap.add dst endpoint t.endpoints;
+                     Lwt.return (`Ok endpoint)
+                   end
+                 ) >>= fun endpoint ->
+
+               Log.debug (fun f -> f "creating local TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
+               Local.create endpoint local_ips
+             end >>= function
              | `Error (`Msg m) ->
                Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
                Lwt.return_unit
@@ -605,11 +611,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     >>= fun () ->
 
     Log.info (fun f -> f "TCP/IP ready");
-    Lwt.return {
-      after_disconnect = Vmnet.after_disconnect x;
-      interface;
-      switch
-    }
+    Lwt.return t
 
   let create config =
     let driver = [ "com.docker.driver.amd64-linux" ] in
