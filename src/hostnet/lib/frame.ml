@@ -1,40 +1,4 @@
 
-module Ethernet = struct
-  type 'a t = {
-    (*
-    src: Macaddr.t;
-    dst: Macaddr.t;
-    *)
-    payload: 'a;
-  }
-end
-
-module Ipv4 = struct
-  type 'a t = {
-    (*
-    src: Ipaddr.V4.t;
-    src: Ipaddr.V4.t;
-    *)
-    payload: 'a;
-  }
-end
-
-module Udp = struct
-  type 'a t = {
-    src_port: int;
-    dst_port: int;
-    payload: 'a;
-  }
-end
-
-module Tcp = struct
-  type 'a t = {
-    src_port: int;
-    dst_port: int;
-    payload: 'a;
-  }
-end
-
 type t =
   | Ethernet: { src: Macaddr.t; dst: Macaddr.t; payload: t } -> t
   | Arp:      { op: [ `Request | `Reply | `Unknown ] } -> t
