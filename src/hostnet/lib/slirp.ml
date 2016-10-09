@@ -293,38 +293,39 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       Log.err (fun f -> f "SYN packet was not intercepted for port %d" port);
       None
 
-    let input_tcp_syn t id (ip, port) (syn: Cstruct.t) =
-      if Tcp.Id.Set.mem id t.pending then begin
-        Log.debug (fun f -> f "%s: connection in progress, ignoring duplicate SYN" (string_of_id id));
-        Lwt.return_unit
+    let input_tcp t ~id ~syn (ip, port) (buf: Cstruct.t) =
+      if syn then begin
+        if Tcp.Id.Set.mem id t.pending then begin
+          (* This can happen if the `connect` blocks for a few seconds *)
+          Log.debug (fun f -> f "%s: connection in progress, ignoring duplicate SYN" (string_of_id id));
+          Lwt.return_unit
+        end else begin
+          t.pending <- Tcp.Id.Set.add id t.pending;
+          Lwt.finalize
+            (fun () ->
+               ( Host.Sockets.Stream.Tcp.connect (ip, port)
+                 >>= function
+                 | `Error (`Msg m) ->
+                   Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string ip) port m);
+                   Lwt.return reject_new_flow
+                 | `Ok socket ->
+                   let t = Tcp.Flow.create id socket in
+                   let listeners port =
+                     Log.debug (fun f -> f "finding listener for port %d" port);
+                     Some (fun flow -> callback t flow)  in
+                   Lwt.return listeners )
+               >>= fun listeners ->
+               Stack_tcp.input t.tcp4 ~listeners ~src:id.Stack_tcp_wire.dest_ip ~dst:id.Stack_tcp_wire.local_ip buf
+            ) (fun () ->
+                t.pending <- Tcp.Id.Set.remove id t.pending;
+                Lwt.return_unit;
+              )
+        end
       end else begin
-        t.pending <- Tcp.Id.Set.add id t.pending;
-        Lwt.finalize
-          (fun () ->
-             ( Host.Sockets.Stream.Tcp.connect (ip, port)
-               >>= function
-               | `Error (`Msg m) ->
-                 Log.err (fun f -> f "%s:%d: failed to connect, sending RST: %s" (Ipaddr.V4.to_string ip) port m);
-                 Lwt.return reject_new_flow
-               | `Ok socket ->
-                 let t = Tcp.Flow.create id socket in
-                 let listeners port =
-                   Log.debug (fun f -> f "finding listener for port %d" port);
-                   Some (fun flow -> callback t flow)  in
-                 Lwt.return listeners )
-             >>= fun listeners ->
-             Log.debug (fun f -> f "input_tcp_syn %s %s" (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) (Ipaddr.V4.to_string ip));
-             Stack_tcp.input t.tcp4 ~listeners ~src:id.Stack_tcp_wire.dest_ip ~dst:ip syn
-          ) (fun () ->
-              t.pending <- Tcp.Id.Set.remove id t.pending;
-              Lwt.return_unit;
-            )
+        Tcp.Flow.touch id;
+        (* non-SYN packets are injected into the stack as normal *)
+        Stack_tcp.input t.tcp4 ~listeners:reject_new_flow ~src:id.Stack_tcp_wire.dest_ip ~dst:id.Stack_tcp_wire.local_ip buf
       end
-
-    let input_tcp t id dst buf =
-      Log.debug (fun f -> f "input_tcp %s %s" (Ipaddr.V4.to_string id.Stack_tcp_wire.dest_ip) (Ipaddr.V4.to_string dst));
-
-      Stack_tcp.input t.tcp4 ~listeners:reject_new_flow ~src:id.Stack_tcp_wire.dest_ip ~dst buf
 
     (* Send an ICMP destination reachable message in response to the given
        packet. This can be used to indicate the packet would have been fragmented
@@ -406,12 +407,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
           | Some nth ->
             begin Dns_forwarder.choose_server ~nth () >>= function
               | Some (_, (Ipaddr.V4 ip, port)) ->
-                if syn then begin
-                  Endpoint.input_tcp_syn t.endpoint id (ip, port) raw
-                end else begin
-                  Tcp.Flow.touch id;
-                  Endpoint.input_tcp t.endpoint id ip raw
-                end
+                Endpoint.input_tcp t.endpoint ~id ~syn (ip, port) raw
               | _ ->
                 (* no IPv4 servers configured *)
                 Lwt.return_unit
@@ -442,12 +438,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       (* TCP to local ports *)
       | Ipv4 { src; dst; payload = Tcp { src = src_port; dst = dst_port; syn; raw; payload = Payload _; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port = dst_port; dest_ip = src; local_ip = dst; dest_port = src_port } in
-        if syn then begin
-          Endpoint.input_tcp_syn t.endpoint id (Ipaddr.V4.localhost, dst_port) raw
-        end else begin
-          Tcp.Flow.touch id;
-          Endpoint.input_tcp t.endpoint id Ipaddr.V4.localhost raw
-        end
+        Endpoint.input_tcp t.endpoint ~id ~syn (Ipaddr.V4.localhost, dst_port) raw
       | _ ->
         Lwt.return_unit
 
@@ -486,12 +477,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let input_ipv4 t ipv4 = match ipv4 with
       | Ipv4 { src = dest_ip; dst = local_ip; payload = Tcp { src = dest_port; dst = local_port; syn; raw; _ }; _ } ->
         let id = { Stack_tcp_wire.local_port; dest_ip; local_ip; dest_port } in
-        if syn then begin
-          Endpoint.input_tcp_syn t.endpoint id (local_ip, local_port) raw
-        end else begin
-          Tcp.Flow.touch id;
-          Endpoint.input_tcp t.endpoint id local_ip raw
-        end
+        Endpoint.input_tcp t.endpoint ~id ~syn (local_ip, local_port) raw
       | Ipv4 { src; dst; ihl; dnf; raw; payload = Udp { src = src_port; dst = dst_port; len; payload = Payload payload; _ }; _ } ->
         let description = Printf.sprintf "%s:%d -> %s:%d"
             (Ipaddr.V4.to_string src) src_port (Ipaddr.V4.to_string dst) dst_port in
