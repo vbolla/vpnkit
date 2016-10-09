@@ -27,6 +27,7 @@ let parse buf =
       ( match ethertype with
         | 0x0800 ->
           let vihl  = Cstruct.get_uint8     inner 0 in
+          let len   = Cstruct.BE.get_uint16 inner (1 + 1) in
           let off   = Cstruct.BE.get_uint16 inner (1 + 1 + 2 + 2) in
           let proto = Cstruct.get_uint8     inner (1 + 1 + 2 + 2 + 2 + 1) in
           let src   = Cstruct.BE.get_uint32 inner (1 + 1 + 2 + 2 + 2 + 1 + 1 + 2) |> Ipaddr.V4.of_int32 in
@@ -34,7 +35,7 @@ let parse buf =
           let dnf = ((off lsr 8) land 0x40) <> 0 in
           let ihl = vihl land 0xf in
           let raw = inner in
-          let inner = Cstruct.shift inner (4 * ihl) in
+          let inner = Cstruct.sub inner (4 * ihl) (len - 4 * ihl) in
           ( match proto with
             | 6 ->
               let src     = Cstruct.BE.get_uint16 inner 0 in
