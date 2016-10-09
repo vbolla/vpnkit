@@ -257,7 +257,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                  | `Ok socket ->
                    let t = Tcp.Flow.create id socket in
                    let listeners port =
-                     Log.debug (fun f -> f "finding listener for port %d" port);
+                     Log.debug (fun f -> f "%s:%d handshake complete" (Ipaddr.V4.to_string ip) port);
                      Some (fun flow -> callback t flow)  in
                    Lwt.return listeners )
                >>= fun listeners ->
@@ -443,13 +443,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
         end
       | _ -> Lwt.return_unit
 
-    let of_ip switch arp_table ip =
-      let open Infix in
-      Endpoint.create switch arp_table ip
-      >>= fun endpoint ->
-
+    let create endpoint =
       let tcp_stack = { endpoint } in
-
       let open Lwt.Infix in
       (* Wire up the listeners to receive future packets: *)
       Switch.Port.listen endpoint.Endpoint.netif
@@ -557,6 +552,20 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     } in
     Lwt.async @@ delete_unused_endpoints t;
 
+    let find_endpoint ip =
+      Lwt_mutex.with_lock t.endpoints_m
+        (fun () ->
+          if IPMap.mem ip t.endpoints
+          then Lwt.return (`Ok (IPMap.find ip t.endpoints))
+          else begin
+            let open Infix in
+            Endpoint.create switch arp_table ip
+            >>= fun endpoint ->
+            t.endpoints <- IPMap.add ip endpoint t.endpoints;
+            Lwt.return (`Ok endpoint)
+          end
+        ) in
+
     (* Add a listener which looks for new flows *)
     Switch.listen switch
       (fun buf ->
@@ -573,18 +582,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
            if List.mem dst local_ips then begin
              begin
                let open Infix in
-               Lwt_mutex.with_lock t.endpoints_m
-                 (fun () ->
-                   if IPMap.mem dst t.endpoints
-                   then Lwt.return (`Ok (IPMap.find dst t.endpoints))
-                   else begin
-                     Endpoint.create switch arp_table dst
-                     >>= fun endpoint ->
-                     t.endpoints <- IPMap.add dst endpoint t.endpoints;
-                     Lwt.return (`Ok endpoint)
-                   end
-                 ) >>= fun endpoint ->
-
+               find_endpoint dst
+               >>= fun endpoint ->
                Log.debug (fun f -> f "creating local TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
                Local.create endpoint local_ips
              end >>= function
@@ -595,9 +594,13 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
                (* inject the ethernet frame into the new stack *)
                Local.input_ipv4 tcp_stack (Ipv4 ipv4)
            end else begin
-             Log.debug (fun f -> f "create remote TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
-             Remote.of_ip switch arp_table dst
-             >>= function
+             begin
+               let open Infix in
+               find_endpoint dst
+               >>= fun endpoint ->
+               Log.debug (fun f -> f "create remote TCP/IP proxy for %s" (Ipaddr.V4.to_string dst));
+               Remote.create endpoint
+             end >>= function
              | `Error (`Msg m) ->
                Log.err (fun f -> f "Failed to create a TCP/IP stack: %s" m);
                Lwt.return_unit
