@@ -1,4 +1,4 @@
-module Make(Netif: V1_LWT.NETWORK)(Time: V1_LWT.TIME) : sig
+module Make(Netif: V1_LWT.NETWORK) : sig
   include V1_LWT.NETWORK
 
   (** A simple ethernet multiplexer/demultiplexer
@@ -27,6 +27,9 @@ module Make(Netif: V1_LWT.NETWORK)(Time: V1_LWT.TIME) : sig
   val port: t -> rule -> Port.t
   (** Given a rule, create a network which will receive traffic matching the
       rule. *)
+
+  val remove: t -> rule -> unit
+  (** Given a rule, remove the associated port if one exists *)
 
   val filesystem: t -> Vfs.Dir.t
   (** A virtual filesystem for debugging *)

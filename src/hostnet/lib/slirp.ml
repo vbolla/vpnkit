@@ -66,7 +66,7 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
   module Filteredif = Filter.Make(Vmnet)
   module Netif = Capture.Make(Filteredif)
-  module Switch = Mux.Make(Netif)(Host.Time)
+  module Switch = Mux.Make(Netif)
   module Dhcp = Dhcp.Make(Switch)
 
   (* This ARP implementation will respond to the VM: *)
@@ -192,6 +192,27 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     let all : t IPMap.t ref = ref IPMap.empty
     let all_m = Lwt_mutex.create ()
+
+    (* If no traffic is received for 5 minutes, delete the endpoint and
+       the switch port. *)
+    let rec delete_unused_endpoints switch () =
+      Host.Time.sleep 30.
+      >>= fun () ->
+      Lwt_mutex.with_lock all_m
+        (fun () ->
+          let now = Unix.gettimeofday () in
+          let old_ips = IPMap.fold (fun ip endpoint acc ->
+              let age = now -. endpoint.last_active_time in
+              if age > 300.0 then ip :: acc else acc
+            ) !all [] in
+          List.iter (fun ip ->
+            Switch.remove switch ip;
+            all := IPMap.remove ip !all
+          ) old_ips;
+          Lwt.return_unit
+        )
+      >>= fun () ->
+      delete_unused_endpoints switch ()
 
     let filesystem =
       Vfs.Dir.of_list
@@ -541,6 +562,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     Switch.connect interface
     >>= fun switch ->
+
+    Lwt.async @@ Endpoint.delete_unused_endpoints switch;
 
     (* Serve a static ARP table *)
     let arp_table = [
