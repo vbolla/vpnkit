@@ -39,15 +39,16 @@ let parse buf =
             | 6 ->
               let src     = Cstruct.BE.get_uint16 inner 0 in
               let dst     = Cstruct.BE.get_uint16 inner 2 in
+              let offres  = Cstruct.get_uint8     inner (2 + 2 + 4 + 4) in
               let flags   = Cstruct.get_uint8     inner (2 + 2 + 4 + 4 + 1) in
-              let payload = Cstruct.shift         inner 16 in
+              let payload = Cstruct.shift         inner ((offres lsr 4) * 4) in
               let syn = (flags land (1 lsl 1)) > 0 in
               Ok (Tcp { src; dst; syn; raw = inner; payload = Payload payload })
             | 17 ->
               let src     = Cstruct.BE.get_uint16 inner 0 in
               let dst     = Cstruct.BE.get_uint16 inner 2 in
               let len     = Cstruct.BE.get_uint16 inner 4 in
-              let payload = Cstruct.shift         inner 16 in
+              let payload = Cstruct.shift         inner 8 in
               Ok (Udp { src; dst; len; payload = Payload payload })
             | _ ->
               Error (`Msg (Printf.sprintf "unknown IPv4 protocol type %d" proto)) )
