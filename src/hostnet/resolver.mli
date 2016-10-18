@@ -1,6 +1,6 @@
 
 type t = {
-  resolvers: (Ipaddr.t * int) list;
+  upstream: Dns_forward_config.t;
   search: string list;
 }
 
