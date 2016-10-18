@@ -58,14 +58,42 @@ type t = {
   search: string list;
 }
 
-let parse_resolvers txt =
-  let resolv_conf = parse_resolv_conf txt in
+let t_of_resolv_conf resolv_conf =
   let upstream = List.map (fun (ip, port) ->
     let address = { Dns_forward_config.ip; port } in
     let zones = [] in
     { Dns_forward_config.zones; address }
-  )
+  ) resolv_conf.resolvers in
+  { upstream; search = resolv_conf.search_domain }
+
+let of_string txt =
+  let resolv_conf = parse_resolv_conf txt in
+
+
 let to_string t =
-  let lines = List.map (fun (ip, port) -> "nameserver " ^ (Ipaddr.to_string ip)
-  ^ "#" ^ (string_of_int port)) t.resolvers in
-  String.concat "\n" lines
+  let nameservers = List.map
+    (fun server ->
+      let open Dns_forward_config in
+      "nameserver " ^ (Ipaddr.to_string server.address.ip) ^ "#" ^ (string_of_int server.address.port)
+    ) t.upstream in
+  let search = List.map
+    (fun search ->
+      "search " ^ search
+    ) t.search in
+  String.concat "\n" (nameservers @ search)
+
+let of_resolv_conf txt =
+  let open Dns.Resolvconf in
+  let lines = Astring.String.cuts ~sep:"\n" txt in
+  let config = List.rev @@ List.fold_left (fun acc x ->
+      match map_line x with
+      | None -> acc
+      | Some x ->
+        begin
+          try
+            KeywordValue.of_string x :: acc
+          with
+          | _ -> acc
+        end
+    ) [] lines in
+  Lwt.return ({ Resolver.resolvers = all_ipv4_servers config; search = []})

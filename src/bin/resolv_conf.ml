@@ -47,18 +47,6 @@ module Make(Files: Sig.FILES) = struct
         Log.err (fun f -> f "Error reading %s: %s" resolv_conf m);
         Lwt.return { Resolver.resolvers = !default_dns; search = [] }
       | `Ok txt ->
-        let lines = Astring.String.cuts ~sep:"\n" txt in
-        let config = List.rev @@ List.fold_left (fun acc x ->
-            match map_line x with
-            | None -> acc
-            | Some x ->
-              begin
-                try
-                  KeywordValue.of_string x :: acc
-                with
-                | _ -> acc
-              end
-          ) [] lines in
-        Lwt.return ({ Resolver.resolvers = all_ipv4_servers config; search = []})
+        Lwt.return (Resolver.of_resolv_conf txt)
 
 end
