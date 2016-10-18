@@ -90,7 +90,17 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let shutdown_write = close
   end
 
-  module Dns_forwarder = Dns_forward.Make(Stack_ipv4)(Stack_udp)(Resolv_conf)(Host.Sockets)(Host.Time)(Recorder)
+  (* DNS uses slightly different protocols over TCP and UDP -- this takes
+     care of the framing over TCP:*)
+  module Dns_tcp_reader_writer = Dns_forward_tcp.ReaderWriter(Stack_tcp)
+
+  (* The resolvers need to be able to make UDP and TCP connections.
+     Note we will map UDP onto UDP and TCP onto TCP, leaving the client to
+     handle the truncated bit and retransmission. *)
+  module Dns_udp_protocol = Dns_forward_udp.Make(Host.Sockets.Datagram.Udp)
+  module Dns_tcp_protocol = Dns_forward_tcp.Make(Host.Sockets.Stream.Tcp)(Host.Time)
+  module Dns_udp_resolver = Dns_forward.Make_resolver(Dns_udp_protocol)(Time)
+  module Dns_tcp_resolver = Dns_forward.Make_resolver(Dns_tcp_protocol)(Time)
 
   let is_dns =
     let open Match in
@@ -322,6 +332,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     switch: Switch.t;
     mutable endpoints: Endpoint.t IPMap.t;
     endpoints_m: Lwt_mutex.t;
+    dns_tcp_resolver: Dns_tcp_resolver.t;
+    dns_udp_resolver: Dns_udp_resolver.t;
   }
 
   let after_disconnect t = t.after_disconnect
@@ -547,6 +559,11 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
 
     let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
 
+    Dns_udp_resolver.create dns_config
+    >>= fun dns_udp_resolver ->
+    Dns_tcp_resolver.create dns_config
+    >>= fun dns_tcp_resolver ->
+
     let endpoints = IPMap.empty in
     let endpoints_m = Lwt_mutex.create () in
     let t = {
@@ -555,6 +572,8 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
       switch;
       endpoints;
       endpoints_m;
+      dns_udp_resolver;
+      dns_tcp_resolver;
     } in
     Lwt.async @@ delete_unused_endpoints t;
 
