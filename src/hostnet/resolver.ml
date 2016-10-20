@@ -6,15 +6,15 @@ let src =
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
+type t = {
+  upstream: Dns_forward_config.t;
+  search: string list;
+}
+
 let nameserver_prefix = "nameserver "
 let search_prefix = "search "
 
-type resolv_conf = {
-  resolvers: (Ipaddr.V4.t * int);
-  search_domain: string;
-}
-
-let parse_resolve_conf txt =
+let of_string txt =
   let open Astring in
   try
     let lines = String.cuts ~sep:"\n" txt in
@@ -53,10 +53,6 @@ let parse_resolve_conf txt =
   with _ -> None
 
 
-type t = {
-  upstream: Dns_forward_config.t;
-  search: string list;
-}
 
 let t_of_resolv_conf resolv_conf =
   let upstream = List.map (fun (ip, port) ->
@@ -96,4 +92,14 @@ let of_resolv_conf txt =
           | _ -> acc
         end
     ) [] lines in
-  Lwt.return ({ Resolver.resolvers = all_ipv4_servers config; search = []})
+  let ipv4_servers = List.fold_left (fun acc x -> match x with
+    (* Remove any IPv6 servers *)
+    | KeywordValue.Nameserver(Ipaddr.V4 ipv4, port) -> (ipv4, port) :: acc
+    | _ -> acc
+  ) [] config |> List.rev in
+  let search = List.fold_left (fun acc x -> match x with
+    | KeywordValue.Search names -> names @ acc
+    | _ -> acc
+  ) [] config |> List.rev in
+  let upstream = List.map (fun (ip, port) -> { Config.address = { Config.ip; port }; zones = [] }) ipv4_servers in
+  Lwt.return ({ upstream; search })
