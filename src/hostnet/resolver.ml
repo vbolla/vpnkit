@@ -13,68 +13,66 @@ type t = {
 
 let nameserver_prefix = "nameserver "
 let search_prefix = "search "
+let zone_prefix = "zone "
 
 let of_string txt =
   let open Astring in
+  let open Dns_forward_config in
   try
-    let lines = String.cuts ~sep:"\n" txt in
-    let r = List.fold_left
+    (* Chop into lines *)
+    String.cuts ~sep:"\n" txt
+    |> List.map String.trim
+    |> List.filter (fun x -> x <> "") in
+    |> List.fold_left
       (fun acc line ->
-        let line = String.trim line in
-        if line = "" then acc
-        else if String.is_prefix ~affix:nameserver_prefix line then begin
-          let line = String.with_range ~first:(String.length nameserver_prefix) line in
-          if String.cut ~sep:"::" line <> None then begin
-            (* IPv6 *)
-            let host = Ipaddr.V6.of_string_exn line in
-            { acc with resolvers = (Ipaddr.V6 host, 53) :: acc.resolvers }
-          end else match String.cut ~sep:"#" line with
-            | Some (host, port) ->
-              (* IPv4 with non-standard port *)
-              let host = Ipaddr.V4.of_string_exn host in
-              let port = int_of_string port in
-              { acc with resolvers = (Ipaddr.V4 host, port) :: acc.resolvers }
-            | None ->
-              (* IPv4 with standard port *)
-              let host = Ipaddr.V4.of_string_exn line in
-              { acc with resolvers = (Ipaddr.V4 host, 53) :: acc.resolvers }
+        if String.is_prefix ~affix:nameserver_prefix line then begin
+        let line = String.with_range ~first:(String.length nameserver_prefix) line in
+        if String.cut ~sep:"::" line <> None then begin
+          (* IPv6 *)
+          let host = Ipaddr.V6.of_string_exn line in
+          `Nameserver (Ipaddr.V6 host, 53) :: acc
+        end else match String.cut ~sep:"#" line with
+          | Some (host, port) ->
+            (* IPv4 with non-standard port *)
+            let host = Ipaddr.V4.of_string_exn host in
+            let port = int_of_string port in
+            `Nameserver (Ipaddr.V4 host, port) :: acc
+          | None ->
+            (* IPv4 with standard port *)
+            let host = Ipaddr.V4.of_string_exn line in
+            `Nameserver (Ipaddr.V4 host, 53)
+        else if String.is_prefix ~affix:zones_prefix line then begin
+          let line = String.with_range ~first:(String.length zone_prefix) line in
+          `Zones (String.cuts ~sep:" " line) :: acc
         end else if String.is_prefix ~affix:search_prefix line then begin
           let line = String.with_range ~first:(String.length search_prefix) line in
-          let all = String.cuts ~sep:" " line in
-          (* They should normally be all on one line, but support one per line
-             since it's more uniform *)
-          { acc with search_domain = all @ acc.search_domain }
-        end else begin
-          Log.err (fun f -> f "skipping unexpected DNS resolv.conf line: %s" line);
-          failwith ("unexpected line " ^ line)
-        end
-      ) { resolvers = []; search_domain = [] } lines in
-    Some { r with resolvers = List.rev r.resolvers }
+          `Search (String.cuts ~sep:" " line) :: acc
+        end else acc
+      ) []
+    (* Merge the zones and nameservers together *)
+    |> List.fold_left
+      (fun (zones_opt, acc) line -> match zones_opt, line with
+        | _, `Zones zones -> (Some zones, acc)
+        | Some zones, `Nameserver (ip, port) ->
+          let zones = List.map (String.cuts ~sep:".") zones in
+          let server = { address = { ip; port }; zones } in
+          None, { acc with upstream = server :: acc.upstream }
+        | _, `Search search ->
+          zones_opt, { acc with search }
+      ) (None, { upstream = []; search = [] })
+    |> List.map (fun x -> Some x)
   with _ -> None
-
-
-
-let t_of_resolv_conf resolv_conf =
-  let upstream = List.map (fun (ip, port) ->
-    let address = { Dns_forward_config.ip; port } in
-    let zones = [] in
-    { Dns_forward_config.zones; address }
-  ) resolv_conf.resolvers in
-  { upstream; search = resolv_conf.search_domain }
-
-let of_string txt =
-  let resolv_conf = parse_resolv_conf txt in
-
 
 let to_string t =
   let nameservers = List.map
     (fun server ->
       let open Dns_forward_config in
-      "nameserver " ^ (Ipaddr.to_string server.address.ip) ^ "#" ^ (string_of_int server.address.port)
-    ) t.upstream in
+      [ nameserver_prefix ^ (Ipaddr.to_string server.address.ip) ^ "#" ^ (string_of_int server.address.port) ]
+      @ (if zones <> [] then [ zones_prefix ^ (String.concat " " server.zones) ] else [])
+    ) t.upstream |> List.concat in
   let search = List.map
     (fun search ->
-      "search " ^ search
+      search_prefix ^ search
     ) t.search in
   String.concat "\n" (nameservers @ search)
 
