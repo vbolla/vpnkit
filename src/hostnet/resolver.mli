@@ -5,6 +5,9 @@ type t = {
 }
 (** DNS configuration *)
 
+val compare: t -> t -> int
+(** The usual comparison operator over configurations *)
+
 (** {1 Serialisation and deserialisation}
 
     These functions convert to and from human-readable strings. These strings

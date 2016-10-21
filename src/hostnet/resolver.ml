@@ -11,6 +11,10 @@ type t = {
   search: string list;
 }
 
+let compare (a: t) (b: t) =
+  let upstream = Dns_forward_config.compare a b in
+  if upstream <> 0 then upstream else Pervasives.compare a.search b.search
+
 let nameserver_prefix = "nameserver "
 let search_prefix = "search "
 let zone_prefix = "zone "
@@ -22,26 +26,26 @@ let of_string txt =
     (* Chop into lines *)
     String.cuts ~sep:"\n" txt
     |> List.map String.trim
-    |> List.filter (fun x -> x <> "") in
+    |> List.filter (fun x -> x <> "")
     |> List.fold_left
       (fun acc line ->
         if String.is_prefix ~affix:nameserver_prefix line then begin
-        let line = String.with_range ~first:(String.length nameserver_prefix) line in
-        if String.cut ~sep:"::" line <> None then begin
-          (* IPv6 *)
-          let host = Ipaddr.V6.of_string_exn line in
-          `Nameserver (Ipaddr.V6 host, 53) :: acc
-        end else match String.cut ~sep:"#" line with
-          | Some (host, port) ->
-            (* IPv4 with non-standard port *)
-            let host = Ipaddr.V4.of_string_exn host in
-            let port = int_of_string port in
-            `Nameserver (Ipaddr.V4 host, port) :: acc
-          | None ->
-            (* IPv4 with standard port *)
-            let host = Ipaddr.V4.of_string_exn line in
-            `Nameserver (Ipaddr.V4 host, 53)
-        else if String.is_prefix ~affix:zones_prefix line then begin
+          let line = String.with_range ~first:(String.length nameserver_prefix) line in
+          if String.cut ~sep:"::" line <> None then begin
+            (* IPv6 *)
+            let host = Ipaddr.V6.of_string_exn line in
+            `Nameserver (Ipaddr.V6 host, 53) :: acc
+          end else match String.cut ~sep:"#" line with
+            | Some (host, port) ->
+              (* IPv4 with non-standard port *)
+              let host = Ipaddr.V4.of_string_exn host in
+              let port = int_of_string port in
+              `Nameserver (Ipaddr.V4 host, port) :: acc
+            | None ->
+              (* IPv4 with standard port *)
+              let host = Ipaddr.V4.of_string_exn line in
+              `Nameserver (Ipaddr.V4 host, 53)
+        end else if String.is_prefix ~affix:zones_prefix line then begin
           let line = String.with_range ~first:(String.length zone_prefix) line in
           `Zones (String.cuts ~sep:" " line) :: acc
         end else if String.is_prefix ~affix:search_prefix line then begin

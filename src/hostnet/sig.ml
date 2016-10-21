@@ -4,7 +4,7 @@ module type FLOW_CLIENT = sig
   type address
 
   val connect: ?read_buffer_size:int -> address
-    -> [ `Ok of flow | `Error of [ `Msg of string ] ] Lwt.t
+    -> (flow, [ `Msg of string ]) Result.result Lwt.t
   (** [connect address] creates a connection to [address] and returns
       he connected flow. *)
 
@@ -93,7 +93,7 @@ module type SOCKETS = sig
   end
   module Stream: sig
     module Tcp: sig
-      type address = Ipaddr.V4.t * int
+      type address = Ipaddr.t * int
 
       include FLOW_CLIENT
         with type address := address

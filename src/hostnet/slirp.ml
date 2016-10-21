@@ -90,17 +90,18 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let shutdown_write = close
   end
 
-  (* DNS uses slightly different protocols over TCP and UDP -- this takes
-     care of the framing over TCP:*)
-  module Dns_tcp_reader_writer = Dns_forward_tcp.ReaderWriter(Stack_tcp)
-
-  (* The resolvers need to be able to make UDP and TCP connections.
-     Note we will map UDP onto UDP and TCP onto TCP, leaving the client to
-     handle the truncated bit and retransmission. *)
-  module Dns_udp_protocol = Dns_forward_udp.Make(Host.Sockets.Datagram.Udp)
-  module Dns_tcp_protocol = Dns_forward_tcp.Make(Host.Sockets.Stream.Tcp)(Host.Time)
-  module Dns_udp_resolver = Dns_forward.Make_resolver(Dns_udp_protocol)(Time)
-  module Dns_tcp_resolver = Dns_forward.Make_resolver(Dns_tcp_protocol)(Time)
+  (* DNS uses slightly different protocols over TCP and UDP. We need both a UDP
+     and TCP resolver configured to use the upstream servers. We will map UDP
+     onto UDP and TCP onto TCP, leaving the client to handle the truncated bit
+     and retransmissions. *)
+  module Dns_tcp_client = Dns_forward.Rpc.Client.Make(Host.Sockets.Stream.Tcp)(Dns_forward.Framing.Tcp(Host.Sockets.Stream.Tcp))(Host.Time)
+  module Dns_tcp_resolver = Dns_forward.Resolver.Make(Dns_tcp_client)(Host.Time)
+  (*
+  module Dns_udp_client = Dns_forward.Rpc.Client.Make(Host.Sockets.Datagram.Udp)(Dns_forward.Framing.Udp(Host.Sockets.Datagram.Udp))(Host.Time)
+  module Dns_udp_resolver = Dns_forward.Resolver.Make(Dns_udp_client)(Host.Time)
+*)
+  (* We need to be able to parse the incoming framed TCP messages *)
+  module Dns_tcp_framing = Dns_forward.Framing.Tcp(Stack_tcp)
 
   let is_dns =
     let open Match in
@@ -558,6 +559,10 @@ module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_C
     let local_ips = local_ip :: extra_dns_ip in
 
     let dhcp = Dhcp.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip ~extra_dns_ip ~get_domain_search switch in
+
+    let dns_config =
+      let open Dns_forward.Config in
+      Server.Set.of_list [ { Server.address = { Address.ip = Ipaddr.of_string_exn "8.8.8.8"; port = 53 }; zones = [] }] in
 
     Dns_udp_resolver.create dns_config
     >>= fun dns_udp_resolver ->
