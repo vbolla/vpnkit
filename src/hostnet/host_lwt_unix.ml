@@ -132,7 +132,7 @@ let unix_bind ty (local_ip, local_port) =
   Lwt.return ((idx, fd) :: extra)
 
 module Datagram = struct
-  type reply = Cstruct.t -> unit Lwt.t
+  type reply = int -> Cstruct.t -> unit Lwt.t
 
   type flow = {
     idx: int;
@@ -206,17 +206,21 @@ module Datagram = struct
              (fun () ->
                 (* Lwt on Win32 doesn't support Lwt_bytes.recvfrom *)
                 Lwt_unix.recvfrom fd bytes 0 (String.length bytes) []
-                >>= fun (n, _) ->
-                Cstruct.blit_from_string bytes 0 buffer 0 n;
-                let response = Cstruct.sub buffer 0 n in
-                ( if oneshot then begin
-                    Hashtbl.remove table (src, src_port);
-                    Lwt_unix.close fd
-                  end else Lwt.return_unit )
-                >>= fun () ->
-                flow.reply response
-                >>= fun () ->
-                Lwt.return (not oneshot)
+                >>= fun (n, sockaddr) ->
+                match sockaddr with
+                | Lwt_unix.ADDR_INET(_, source_port) ->
+                  Cstruct.blit_from_string bytes 0 buffer 0 n;
+                  let response = Cstruct.sub buffer 0 n in
+                  ( if oneshot then begin
+                      Hashtbl.remove table (src, src_port);
+                      Lwt_unix.close fd
+                    end else Lwt.return_unit )
+                  >>= fun () ->
+                  flow.reply source_port response
+                  >>= fun () ->
+                  Lwt.return (not oneshot)
+                | _ ->
+                  Lwt.return true
              ) (function
                  | Unix.Unix_error(Unix.EBADF, _, _) ->
                    (* fd has been closed by the GC *)

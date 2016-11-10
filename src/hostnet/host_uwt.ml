@@ -103,7 +103,7 @@ module Sockets = struct
     Hashtbl.remove connection_table idx
 
   module Datagram = struct
-    type reply = Cstruct.t -> unit Lwt.t
+    type reply = int -> Cstruct.t -> unit Lwt.t
 
     type flow = {
       idx: int;
@@ -177,10 +177,11 @@ module Sockets = struct
                     if recv.Uwt.Udp.is_partial then begin
                       Log.err (fun f -> f "Socket.Datagram.input %s: dropping partial response (buffer was %d)" description (Cstruct.len buf));
                       Lwt.return true
-                    end else if recv.Uwt.Udp.sockaddr = None then begin
+                    end else match recv.Uwt.Udp.sockaddr with
+                    | None ->
                       Log.err (fun f -> f "Socket.Datagram.input %s: dropping response from unknown sockaddr" description);
                       Lwt.return true
-                    end else begin
+                    | Some (Unix.ADDR_INET(_, source_port)) ->
                       if oneshot then begin
                         (* Remove our flow entry immediately, clean up synchronously *)
                         Log.debug (fun f -> f "Socket.Datagram %s: expiring UDP NAT rule immediately" flow.description);
@@ -188,10 +189,12 @@ module Sockets = struct
                         let _ = Uwt.Udp.close fd in
                         deregister_connection idx
                       end;
-                      flow.reply (Cstruct.sub buf 0 recv.Uwt.Udp.recv_len)
+                      flow.reply source_port (Cstruct.sub buf 0 recv.Uwt.Udp.recv_len)
                       >>= fun () ->
                       Lwt.return (not oneshot)
-                    end
+                    | Some _ ->
+                      Log.err (fun f -> f "Socket.Datagram.input %s: dropping response from unexpected sockaddr type" description);
+                      Lwt.return true
                  ) (function
                      | Uwt.Uwt_error(Uwt.ECANCELED, _, _) ->
                        (* fd has been closed by the GC *)

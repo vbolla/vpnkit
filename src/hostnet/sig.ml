@@ -57,7 +57,7 @@ module type DATAGRAM = sig
 
   type address
 
-  type reply = Cstruct.t -> unit Lwt.t
+  type reply = int -> Cstruct.t -> unit Lwt.t
 
   val input: ?userdesc:string -> oneshot:bool -> reply:reply -> src:address -> dst:address -> payload:Cstruct.t -> unit -> unit Lwt.t
 
